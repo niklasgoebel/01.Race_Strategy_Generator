@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import json
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 
-from .athlete_profile import get_default_athlete_profile
+from .athlete_profile import get_default_athlete_profile  # useful for demos
 
-# Make sure environment variables from .env are loaded
+# Load environment variables from .env (including OPENAI_API_KEY)
 load_dotenv()
 
-# OpenAI client – uses OPENAI_API_KEY from environment
+# OpenAI client – reads OPENAI_API_KEY from environment by default
 client = OpenAI()
 
+
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
 
 def build_strategy_prompt(
     course_summary: Dict[str, Any],
@@ -126,12 +130,6 @@ ATHLETE PROFILE
 - Fuel type: {athlete_profile.get("fuel_type")}
 - Target carbs per hour: {athlete_profile.get("carbs_per_hour_target_g")} g
 
-NOTES:
-- Max HR: {athlete_profile.get("max_hr")}
-- Lactate threshold HR: {athlete_profile.get("lactate_threshold_hr")}
-- Goal type: {athlete_profile.get("goal_type")}
-- Fueling target: {athlete_profile.get("carbs_per_hour_target_g")} g carbs/hour
-
 COURSE OVERVIEW (SEGMENTS)
 Each row:
   type | start_km–end_km | distance_km | gain/loss | avg_gradient
@@ -160,11 +158,16 @@ Please:
     return prompt
 
 
+# ---------------------------------------------------------------------------
+# JSON extraction helper
+# ---------------------------------------------------------------------------
+
 def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
     Try to locate and parse a JSON object inside a larger text response.
 
     Handles cases where the model wraps JSON in ```json ... ``` fences.
+    Returns None silently if parsing fails.
     """
     cleaned = text.strip()
 
@@ -191,23 +194,25 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def generate_race_strategy(
     course_summary: Dict[str, Any],
     segment_summaries: List[str],
     climb_summaries: List[str],
-    athlete_profile: Optional[Dict[str, Any]] = None,
-    model: str = "gpt-5-mini",
-    max_output_tokens: int = 1800,
+    athlete_profile: Dict[str, Any],
+    model: str = "gpt-4.1-mini",
+    max_output_tokens: int = 2500,
+    verbose: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
-    Generate a race strategy using the OpenAI Responses API.
+    Call the OpenAI Responses API to generate:
 
-    Returns:
-        (human_readable_text, structured_json_or_none)
+    - strategy_text: human-readable narrative strategy
+    - strategy_data: structured JSON object (or None if parsing fails)
     """
-    if athlete_profile is None:
-        athlete_profile = get_default_athlete_profile()
-
     prompt = build_strategy_prompt(
         course_summary=course_summary,
         segment_summaries=segment_summaries,
@@ -215,52 +220,63 @@ def generate_race_strategy(
         athlete_profile=athlete_profile,
     )
 
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        max_output_tokens=max_output_tokens,
-    )
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": "You are an expert ultra-trail running coach and race strategist.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+    except BadRequestError as e:
+        # Let the caller handle it, but keep the message readable
+        raise RuntimeError(
+            f"OpenAI BadRequestError: {getattr(e, 'message', str(e))}"
+        ) from e
 
-    # Extract raw text from the response (Responses API format)
-    raw_text = response.output[0].content[0].text
+    if verbose:
+        print("OpenAI response id:", response.id)
 
-    # Split: human narrative + JSON (if possible)
+    # Responses API format: response.output is a list of messages
+    output = getattr(response, "output", None)
+    if not output or not output[0].content:
+        raise RuntimeError(f"No usable 'output' in OpenAI response: {response}")
+
+    raw_text = output[0].content[0].text
     parsed_json = _extract_json_from_text(raw_text)
+
+    if verbose and parsed_json is None:
+        print("Warning: could not parse JSON from model output.")
 
     return raw_text, parsed_json
 
 
-def main_demo():
-    """
-    Simple CLI-style demo stub.
+# ---------------------------------------------------------------------------
+# Simple CLI-style demo (optional)
+# ---------------------------------------------------------------------------
 
-    This file is meant to be imported from a notebook or another script
-    that already has:
+def main_demo() -> None:
+    """
+    Simple demo for running this module directly.
+
+    In practice you'll usually import generate_race_strategy from a notebook
+    or another script that already has:
+
       - course_summary
       - segment_summaries
       - climb_summaries
-
-    Example (from a notebook):
-
-        from src.race_strategy_generator import generate_race_strategy
-        from src.athlete_profile import get_default_athlete_profile
-
-        athlete = get_default_athlete_profile()
-        text, data = generate_race_strategy(
-            course_summary,
-            segment_summaries,
-            climb_summaries,
-            athlete_profile=athlete,
-        )
-
+      - athlete_profile
     """
     print("race_strategy_generator.py is intended to be imported, not run directly.")
-    print("Use generate_race_strategy(course_summary, segment_summaries, climb_summaries).")
+    print("Use generate_race_strategy(course_summary, segment_summaries, "
+          "climb_summaries, athlete_profile).")
 
 
 if __name__ == "__main__":
