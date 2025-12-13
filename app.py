@@ -61,28 +61,44 @@ def cached_full_run(
 
 def _split_readable_and_json(text: str) -> Tuple[str, str]:
     """
-    Split combined output into:
-      - readable narrative
-      - JSON-ish tail (optional)
+    Split combined model output into:
+      - readable narrative (coach notes)
+      - JSON tail (optional)
+
+    Handles:
+      - ```json ...``` fenced output
+      - narrative + JSON appended
+      - PART 1 / PART 2 headings
     """
     if not text:
         return "", ""
 
     t = text.strip()
 
-    # Prefer fenced JSON
+    # 1) Prefer fenced JSON if present
     m = re.search(r"```json\s*(\{.*?\})\s*```", t, flags=re.DOTALL | re.IGNORECASE)
     if m:
         json_part = m.group(1).strip()
         readable = (t[: m.start()] + t[m.end() :]).strip()
-        return readable, json_part
+    else:
+        # 2) Otherwise split at first JSON object start
+        # Look for a "{" that likely begins the JSON object.
+        idx = t.find("{")
+        if idx != -1:
+            readable = t[:idx].strip()
+            json_part = t[idx:].strip()
+        else:
+            readable, json_part = t, ""
 
-    # Fallback: first '{' that looks like JSON start near a line break
-    idx = t.find("\n{")
-    if idx != -1:
-        return t[:idx].strip(), t[idx:].strip()
+    # Remove possible PART headings
+    readable = re.sub(r"(?im)^\s*PART\s*1\s*—.*$", "", readable).strip()
+    readable = re.sub(r"(?im)^\s*PART\s*2\s*—.*$", "", readable).strip()
 
-    return t, ""
+    # Belt + suspenders: if readable still looks like JSON, blank it
+    if readable.startswith("{") or readable.startswith("[") or "{\n" in readable:
+        readable = ""
+
+    return readable, json_part
 
 
 def _init_state() -> None:
@@ -153,7 +169,6 @@ if st.sidebar.button("Clear cache"):
 # Actions
 # -------------------------
 def _run_full_pipeline(upload) -> Tuple[Optional[PipelineResult], Optional[str]]:
-    # IMPORTANT: use getvalue() so we don't consume the file stream
     file_bytes = upload.getvalue()
     digest = _file_digest(file_bytes)
 
@@ -257,8 +272,8 @@ with tab_course:
     st.dataframe(result.overview_df, use_container_width=True)
 
     st.subheader("Elevation profile")
-
     df = result.df_gpx.copy()
+
     if "cum_distance" in df.columns:
         x_km = df["cum_distance"].to_numpy(dtype=float) / 1000.0
     else:
@@ -279,7 +294,6 @@ with tab_course:
     st.pyplot(fig, clear_figure=True)
 
     st.subheader("Gradient (approx)")
-
     dx_m = np.gradient(df["cum_distance"].to_numpy(dtype=float))
     de_m = np.gradient(elev)
 
@@ -318,7 +332,6 @@ with tab_course:
 
 with tab_segments:
     st.subheader("Segments & Climbs")
-
     st.markdown("### Filters")
     col1, col2, col3 = st.columns(3)
 
@@ -350,52 +363,97 @@ with tab_segments:
 
 with tab_strategy:
     st.subheader("Race strategy")
+    data = result.strategy_data or {}
 
-    readable, _json_tail = _split_readable_and_json(result.strategy_text or "")
+    def _safe_text(x) -> str:
+        return (x or "").strip()
+
+    def _show_card(title: str, body: str):
+        st.markdown(f"**{title}**")
+        st.write(body if body else "—")
+
+    raw_text = (result.strategy_text or "").strip()
+    readable, _json_tail = _split_readable_and_json(raw_text)
+    readable = _safe_text(readable)
+
+    st.markdown("### Coach notes")
     if readable:
         st.markdown(readable)
     else:
-        st.info("No narrative strategy text returned.")
+        st.info(
+            "This run didn't include a separate narrative strategy. "
+            "Showing the structured plan below instead."
+        )
 
     st.divider()
-    st.subheader("Structured guidance")
 
-    data = result.strategy_data or {}
-    if not data:
+    st.markdown("### Plan by race phase")
+    gs = (data.get("global_strategy") or {}) if isinstance(data, dict) else {}
+    if gs:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _show_card("🟢 Early", _safe_text(gs.get("early")))
+        with c2:
+            _show_card("🟡 Mid", _safe_text(gs.get("mid")))
+        with c3:
+            _show_card("🔴 Late", _safe_text(gs.get("late")))
+    else:
         st.warning(
-            "Structured JSON could not be parsed this run. "
-            "Try **Retry strategy only (LLM)** with a higher token limit."
+            "Structured strategy (global_strategy) missing. "
+            "Try **Retry strategy only (LLM)** with higher token limit."
+        )
+
+    st.divider()
+
+    st.markdown("### Critical sections")
+    if result.strategy_tables and "critical_sections" in result.strategy_tables:
+        st.dataframe(
+            result.strategy_tables["critical_sections"],
+            use_container_width=True,
+            hide_index=True,
         )
     else:
-        gs = data.get("global_strategy", {}) or {}
-        if gs:
-            col1, col2, col3 = st.columns(3)
-            col1.markdown("**Early**")
-            col1.write(gs.get("early", "—"))
-            col2.markdown("**Mid**")
-            col2.write(gs.get("mid", "—"))
-            col3.markdown("**Late**")
-            col3.write(gs.get("late", "—"))
+        st.info("No critical sections table available for this run.")
 
-        st.markdown("### Critical sections")
-        if result.strategy_tables and "critical_sections" in result.strategy_tables:
-            st.dataframe(result.strategy_tables["critical_sections"], use_container_width=True)
+    st.markdown("### Pacing chunks")
+    if result.strategy_tables and "pacing_chunks" in result.strategy_tables:
+        st.dataframe(
+            result.strategy_tables["pacing_chunks"],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No pacing chunks table available for this run.")
+
+    st.divider()
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("### Fueling target")
+        fp = (data.get("fueling_plan") or {}) if isinstance(data, dict) else {}
+        carbs = fp.get("carbs_g_per_hour", "—")
+        st.metric("Carbs (g/hr)", carbs)
+
+    with colB:
+        st.markdown("### Mental cue (preview)")
+        cues = (data.get("mental_cues") or []) if isinstance(data, dict) else []
+        if cues:
+            first = cues[0]
+            st.write(f"**km {first.get('km','?')}** — {first.get('cue','')}")
         else:
-            st.info("No critical_sections table available.")
+            st.write("—")
 
-        st.markdown("### Pacing chunks")
-        if result.strategy_tables and "pacing_chunks" in result.strategy_tables:
-            st.dataframe(result.strategy_tables["pacing_chunks"], use_container_width=True)
-        else:
-            st.info("No pacing_chunks table available.")
-
-        with st.expander("Show parsed JSON (debug)"):
-            st.json(data)
+    with st.expander("Debug: show parsed JSON"):
+        st.json(data)
 
 with tab_fueling:
-    st.subheader("Fueling plan")
-    fp = (result.strategy_data or {}).get("fueling_plan") if result.strategy_data else None
+    st.subheader("Fueling & mental cues")
+    data = result.strategy_data or {}
 
+    fp = data.get("fueling_plan") if isinstance(data, dict) else None
+    cues = (data.get("mental_cues") or []) if isinstance(data, dict) else []
+
+    st.markdown("### Fueling plan")
     if not fp:
         st.info("No fueling_plan found (likely JSON parse failed).")
     else:
@@ -404,7 +462,7 @@ with tab_fueling:
             st.metric("Carbs (g/hr)", fp.get("carbs_g_per_hour", "—"))
         with col2:
             st.markdown("**Hydration notes**")
-            st.write(fp.get("hydration_notes", ""))
+            st.write(fp.get("hydration_notes", "—"))
 
         special = fp.get("special_sections", []) or []
         if special:
@@ -415,8 +473,9 @@ with tab_fueling:
                     f"- Focus: {item.get('fueling_focus','')}"
                 )
 
-    st.subheader("Mental cues")
-    cues = (result.strategy_data or {}).get("mental_cues", []) if result.strategy_data else []
+    st.divider()
+
+    st.markdown("### Mental cues")
     if not cues:
         st.info("No mental_cues found (likely JSON parse failed).")
     else:

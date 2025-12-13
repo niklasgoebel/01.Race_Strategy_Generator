@@ -136,8 +136,19 @@ KEY CLIMBS (MOST IMPORTANT FEATURES)
     task_block = """
 TASK
 
-You are NOT writing general training advice.
-You are writing a CONCRETE RACE STRATEGY for this one event for this specific athlete.
+You MUST output in TWO PARTS, in this exact order:
+
+PART 1 — COACH NOTES (human-readable)
+- Write 10–15 bullet points.
+- Short, concrete, actionable.
+- Reference specific course sections (km ranges, key climbs).
+- Include pacing guidance using RPE + % of max HR.
+- Include fueling reminders where relevant.
+- Do NOT include any JSON, braces, or code blocks in Part 1.
+
+PART 2 — JSON (machine-readable)
+- On a new line after Part 1, output ONLY a valid JSON object following the schema below.
+- No markdown fences. No extra commentary. Only JSON.
 """
 
     if json_only:
@@ -238,9 +249,9 @@ def generate_race_strategy(
     climb_summaries: List[str],
     athlete_profile: Dict[str, Any],
     *,
-    json_only: bool = True,
+    json_only: bool = False,
     model: str = "gpt-4.1-mini",
-    max_output_tokens: int = 2000,
+    max_output_tokens: int = 3500,
     verbose: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     """
@@ -259,10 +270,12 @@ def generate_race_strategy(
     )
 
     try:
-        # Keep it simple: just a user message
         response = client.responses.create(
             model=model,
-            input=[{"role": "user", "content": prompt}],
+            input=[
+              {"role": "system", "content": "You are an expert ultra-trail running coach and race strategist."},
+              {"role": "user", "content": prompt},
+            ],
             max_output_tokens=max_output_tokens,
         )
     except BadRequestError as e:
