@@ -133,7 +133,7 @@ KEY CLIMBS (MOST IMPORTANT FEATURES)
 {climb_text}
 """
 
-    task_block = """
+    task_block_two_part = """
 TASK
 
 You MUST output in TWO PARTS, in this exact order:
@@ -149,6 +149,15 @@ PART 1 — COACH NOTES (human-readable)
 PART 2 — JSON (machine-readable)
 - On a new line after Part 1, output ONLY a valid JSON object following the schema below.
 - No markdown fences. No extra commentary. Only JSON.
+"""
+
+    task_block_json_only = """
+TASK
+
+You MUST output ONLY a valid JSON object following the schema below.
+- No markdown fences. No extra commentary. Only JSON.
+- Use double quotes for all strings.
+- No trailing commas.
 """
 
     if json_only:
@@ -186,8 +195,8 @@ JSON schema:
 {json_schema}
 """
 
+    task_block = task_block_json_only if json_only else task_block_two_part
     return f"{common_context}\n{task_block}\n{output_block}".strip()
-
 
 # ---------------------------------------------------------------------------
 # JSON extraction helper
