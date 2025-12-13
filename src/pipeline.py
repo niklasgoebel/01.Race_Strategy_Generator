@@ -8,7 +8,7 @@ from typing import Any, Dict
 import pandas as pd
 
 from src.loaders.gpx_loader import load_gpx_to_df
-from src.course.course_builder import build_full_course_model
+from src.course_model import build_full_course_model
 from src.athlete_profile import get_default_athlete_profile
 from src.race_strategy_generator import generate_race_strategy
 from src.outputs.output_formatter import (
