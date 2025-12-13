@@ -298,6 +298,17 @@ def generate_race_strategy(
     raw_text = _response_text_from_responses_api(response)
     parsed_json = _extract_json_from_text(raw_text)
 
+    # Extract coach notes (only when not json_only)
+    strategy_text: Optional[str] = None
+
+    if not json_only:
+        # Everything before the first JSON object is considered coach notes
+        first_brace = raw_text.find("{")
+        if first_brace > 0:
+            strategy_text = raw_text[:first_brace].strip()
+        else:
+            strategy_text = raw_text.strip()
+
     if parsed_json is None:
         # Fail loudly so pipeline doesn't silently produce empty tables
         raise RuntimeError(
@@ -305,8 +316,13 @@ def generate_race_strategy(
             "Try increasing max_output_tokens or inspect raw_text."
         )
 
-    return raw_text, parsed_json
+    if not json_only and not strategy_text:
+      raise RuntimeError(
+        "Full strategy generation did not produce coach notes. "
+        "This should never happen."
+      )
 
+    return strategy_text or raw_text, parsed_json
 
 # ---------------------------------------------------------------------------
 # Simple CLI-style demo (optional)

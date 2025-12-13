@@ -30,8 +30,8 @@ class PipelineConfig:
     llm_model: str = "gpt-4.1-mini"
     llm_max_output_tokens: int = 2000
 
-    # force JSON-only output (recommended for reliability)
-    llm_json_only: bool = True
+    # JSON-only mode is for retries only, not initial generation
+    llm_json_only: bool = False
 
     # helpful during debugging
     llm_verbose: bool = False
@@ -82,6 +82,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
 
     # 3) Generate strategy from LLM
     athlete_profile = get_default_athlete_profile()
+    # Always generate FULL strategy on initial pipeline run
     strategy_text, strategy_data = generate_race_strategy(
         course_summary=course_summary,
         segment_summaries=segment_summaries,
@@ -89,7 +90,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         athlete_profile=athlete_profile,
         model=cfg.llm_model,
         max_output_tokens=cfg.llm_max_output_tokens,
-        json_only=cfg.llm_json_only,
+        json_only=False,
         verbose=cfg.llm_verbose,
     )
     # generate_race_strategy now raises if JSON can't be parsed, so strategy_data is guaranteed here.

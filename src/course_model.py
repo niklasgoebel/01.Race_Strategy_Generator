@@ -18,7 +18,9 @@ def resample_to_uniform(df_gpx: pd.DataFrame, step_m: float = 20.0) -> pd.DataFr
     elev = df_gpx["elev_smooth"].to_numpy()
 
     total = dist[-1]
-    target = np.arange(0, total, step_m)
+    # include endpoint so the final distance is represented
+    target = np.arange(0, total + step_m, step_m)
+    target = target[target <= total]
 
     lat_u = np.interp(target, dist, lat)
     lon_u = np.interp(target, dist, lon)
@@ -105,10 +107,12 @@ def segments_from_labels(df_res: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def merge_micro_segments(segments_df: pd.DataFrame,
-                         df_res: pd.DataFrame,
-                         step_m: int = 20,
-                         min_segment_km: float = 0.2) -> pd.DataFrame:
+def merge_micro_segments(
+            segments_df: pd.DataFrame,
+            df_res: pd.DataFrame,
+            min_segment_km: float = 0.2,
+        ) -> pd.DataFrame:
+
     if segments_df.empty:
         return segments_df.copy()
 
@@ -122,14 +126,23 @@ def merge_micro_segments(segments_df: pd.DataFrame,
             current["end_km"] = row["end_km"]
             current["distance_km"] = current["end_km"] - current["start_km"]
 
-            start_idx = int(current["start_km"] * 1000 / step_m)
-            end_idx   = int(current["end_km"]   * 1000 / step_m)
+            cum = df_res["cum_distance"].to_numpy()
 
-            elev = df_res["elev_smooth"]
-            g    = df_res["gradient_final"]
+            start_m = float(current["start_km"]) * 1000.0
+            end_m = float(current["end_km"]) * 1000.0
 
-            current["elev_change_m"] = elev.iloc[end_idx] - elev.iloc[start_idx]
-            current["avg_gradient"]  = g.iloc[start_idx:end_idx+1].mean()
+            start_idx = int(np.searchsorted(cum, start_m, side="left"))
+            end_idx = int(np.searchsorted(cum, end_m, side="right"))
+
+            # clamp to valid bounds
+            start_idx = max(0, min(start_idx, len(cum) - 1))
+            end_idx = max(start_idx + 1, min(end_idx, len(cum)))
+
+            elev = df_res["elev_smooth"].to_numpy()
+            g = df_res["gradient_final"].to_numpy()
+
+            current["elev_change_m"] = float(elev[end_idx - 1] - elev[start_idx])
+            current["avg_gradient"] = float(np.nanmean(g[start_idx:end_idx]))
         else:
             merged.append(current.copy())
             current = row.copy()
@@ -217,7 +230,7 @@ def build_full_course_model(df_gpx: pd.DataFrame,
     df_res = add_segment_labels(df_res)
 
     raw_segments = segments_from_labels(df_res)
-    merged_segments = merge_micro_segments(raw_segments, df_res, step_m=step_m, min_segment_km=min_segment_km)
+    merged_segments = merge_micro_segments(raw_segments, df_res, min_segment_km=min_segment_km)
     seg = enrich_segments(merged_segments)
     key_climbs = extract_key_climbs(seg)
 
