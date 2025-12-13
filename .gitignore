@@ -5,18 +5,29 @@ env/
 
 # Secrets
 .env
+.streamlit/secrets.toml
 
 # Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Jupyter
 .ipynb_checkpoints/
 
-# OS / editor junk
+# OS junk
 .DS_Store
 Thumbs.db
 
-# VSCode / Cursor / IDE settings (optional)
+# IDEs
 .vscode/
 .idea/
+
+# Build / test artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
