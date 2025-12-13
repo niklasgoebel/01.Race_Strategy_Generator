@@ -28,7 +28,6 @@ def _file_digest(data: bytes) -> str:
 def cached_full_run(
     gpx_bytes: bytes,
     filename: str,
-    elevation_floor_m: float,
     savgol_window_length: int,
     savgol_polyorder: int,
     llm_model: str,
@@ -41,7 +40,7 @@ def cached_full_run(
     NOTE: this caches the LLM call too (good for cost + speed),
     but means identical inputs will reuse the same output.
     """
-    from src.pipeline import run_pipeline, PipelineConfig  # local import to keep cache stable
+    from src.pipeline import run_pipeline, PipelineConfig  # local import keeps cache stable
 
     with tempfile.TemporaryDirectory() as tmpdir:
         gpx_path = Path(tmpdir) / filename
@@ -49,13 +48,11 @@ def cached_full_run(
 
         cfg = PipelineConfig(
             gpx_path=str(gpx_path),
-            elevation_floor_m=float(elevation_floor_m),
             savgol_window_length=int(savgol_window_length),
             savgol_polyorder=int(savgol_polyorder),
             llm_model=str(llm_model),
             llm_max_output_tokens=int(llm_max_output_tokens),
         )
-
         return run_pipeline(cfg)
 
 
@@ -75,14 +72,11 @@ def _split_readable_and_json(text: str) -> Tuple[str, str]:
 
     t = text.strip()
 
-    # 1) Prefer fenced JSON if present
     m = re.search(r"```json\s*(\{.*?\})\s*```", t, flags=re.DOTALL | re.IGNORECASE)
     if m:
         json_part = m.group(1).strip()
         readable = (t[: m.start()] + t[m.end() :]).strip()
     else:
-        # 2) Otherwise split at first JSON object start
-        # Look for a "{" that likely begins the JSON object.
         idx = t.find("{")
         if idx != -1:
             readable = t[:idx].strip()
@@ -90,11 +84,9 @@ def _split_readable_and_json(text: str) -> Tuple[str, str]:
         else:
             readable, json_part = t, ""
 
-    # Remove possible PART headings
     readable = re.sub(r"(?im)^\s*PART\s*1\s*—.*$", "", readable).strip()
     readable = re.sub(r"(?im)^\s*PART\s*2\s*—.*$", "", readable).strip()
 
-    # Belt + suspenders: if readable still looks like JSON, blank it
     if readable.startswith("{") or readable.startswith("[") or "{\n" in readable:
         readable = ""
 
@@ -125,10 +117,7 @@ st.caption("Upload a GPX file and generate a personalized race strategy.")
 st.sidebar.header("Inputs")
 gpx_file = st.sidebar.file_uploader("Upload GPX file", type=["gpx"])
 
-st.sidebar.header("GPX cleaning")
-elevation_floor = st.sidebar.number_input(
-    "Elevation floor (m)", min_value=0, max_value=2000, value=200, step=10
-)
+st.sidebar.header("Elevation smoothing (advanced)")
 savgol_window = st.sidebar.number_input(
     "Savgol window length (odd)", min_value=5, max_value=101, value=13, step=2
 )
@@ -147,13 +136,16 @@ llm_max_output_tokens = st.sidebar.slider(
     help="If JSON parsing fails, increase this first.",
 )
 
+st.sidebar.header("Diagnostics (optional)")
+show_debug = st.sidebar.checkbox("Show elevation debug overlay", value=False)
+
 run_btn = st.sidebar.button("Run analysis", type="primary", disabled=(gpx_file is None))
 
 st.sidebar.divider()
 
 retry_btn = st.sidebar.button(
     "Retry strategy only (LLM)",
-    help="Re-run ONLY the LLM using the already-built course summaries from the last run.",
+    help="Re-run ONLY the LLM using the already-built course summaries from the last run (JSON-only retry).",
     disabled=(st.session_state["last_result"] is None),
 )
 
@@ -177,7 +169,6 @@ def _run_full_pipeline(upload) -> Tuple[Optional[PipelineResult], Optional[str]]
             res = cached_full_run(
                 gpx_bytes=file_bytes,
                 filename=upload.name,
-                elevation_floor_m=float(elevation_floor),
                 savgol_window_length=int(savgol_window),
                 savgol_polyorder=int(savgol_polyorder),
                 llm_model=str(llm_model),
@@ -201,6 +192,7 @@ def _retry_llm_only() -> Tuple[Optional[PipelineResult], Optional[str]]:
 
     try:
         with st.spinner("Retrying strategy generation (LLM only)..."):
+            # JSON-only retry: robust & consistent parsing
             strategy_text, strategy_data = generate_race_strategy(
                 course_summary=res.course_summary,
                 segment_summaries=res.segment_summaries,
@@ -208,17 +200,14 @@ def _retry_llm_only() -> Tuple[Optional[PipelineResult], Optional[str]]:
                 athlete_profile=athlete_profile,
                 model=str(llm_model),
                 max_output_tokens=int(llm_max_output_tokens),
+                json_only=True,
             )
     except Exception as e:
         return None, str(e)
 
     res.strategy_text = strategy_text
     res.strategy_data = strategy_data
-
-    if strategy_data is not None:
-        res.strategy_tables = make_strategy_tables(strategy_data)
-    else:
-        res.strategy_tables = {}
+    res.strategy_tables = make_strategy_tables(strategy_data) if strategy_data else {}
 
     st.session_state["last_result"] = res
     return res, None
@@ -240,7 +229,6 @@ if error_msg:
     st.error(f"Pipeline failed: {error_msg}")
 
 result: Optional[PipelineResult] = st.session_state["last_result"]
-
 if result is None:
     st.info("Configure settings in the sidebar, then click **Run analysis**.")
     st.stop()
@@ -271,26 +259,62 @@ with tab_course:
     st.subheader("Course overview")
     st.dataframe(result.overview_df, use_container_width=True)
 
+    # Elevation quality warnings (from robust elevation cleaner)
+    eq = result.course_summary.get("elevation_quality") if isinstance(result.course_summary, dict) else None
+    if isinstance(eq, dict):
+        missing_frac = float(eq.get("missing_frac", 0.0) or 0.0)
+        spike_frac = float(eq.get("spike_frac", 0.0) or 0.0)
+        spikes_fixed = int(eq.get("spikes_fixed", 0) or 0)
+        notes = str(eq.get("notes", "") or "")
+
+        if missing_frac > 0.05:
+            st.warning(f"Elevation data has gaps (missing ~{missing_frac*100:.1f}%). Climb precision may be reduced.")
+        if spike_frac > 0.01 or spikes_fixed > 0:
+            st.warning(
+                f"Elevation data appears noisy/spiky (fixed {spikes_fixed} points; spike ~{spike_frac*100:.1f}%)."
+            )
+        if notes and notes != "ok":
+            st.caption(f"Elevation diagnostics: {notes}")
+
     st.subheader("Elevation profile")
     df = result.df_gpx.copy()
 
-    if "cum_distance" in df.columns:
-        x_km = df["cum_distance"].to_numpy(dtype=float) / 1000.0
-    else:
+    if "cum_distance" not in df.columns:
         st.warning("No cum_distance found in df_gpx.")
         st.stop()
 
-    if "elev_smooth" in df.columns:
-        elev = df["elev_smooth"].to_numpy(dtype=float)
-    elif "elev_clean" in df.columns:
-        elev = df["elev_clean"].to_numpy(dtype=float)
-    else:
-        elev = df["elev_raw"].to_numpy(dtype=float)
+    x_km = df["cum_distance"].to_numpy(dtype=float) / 1000.0
+
+    # Prefer smoothed elevation, fallback to raw
+    elev = (
+        df["elev_smooth"].to_numpy(dtype=float)
+        if "elev_smooth" in df.columns
+        else df["elev_raw"].to_numpy(dtype=float)
+    )
 
     fig, ax = plt.subplots()
-    ax.plot(x_km, elev)
+
+    # Optional debug overlay: raw elevation
+    if show_debug and "elev_raw" in df.columns:
+        ax.plot(
+            x_km,
+            df["elev_raw"].to_numpy(dtype=float),
+            alpha=0.35,
+            label="raw",
+        )
+
+    ax.plot(x_km, elev, linewidth=2, label="smooth" if show_debug else None)
     ax.set_xlabel("Distance (km)")
     ax.set_ylabel("Elevation (m)")
+    if show_debug:
+        ax.legend()
+
+        dd = np.diff(df["cum_distance"].to_numpy(dtype=float))
+        st.caption(f"Step distance percentiles (m): {np.percentile(dd, [1, 5, 50, 95, 99])}")
+
+        if isinstance(eq, dict):
+            st.caption(f"Elevation quality dict: {eq}")
+
     st.pyplot(fig, clear_figure=True)
 
     st.subheader("Gradient (approx)")
@@ -349,8 +373,8 @@ with tab_segments:
     if "type" in seg_df.columns and seg_type:
         seg_df = seg_df[seg_df["type"].isin(seg_type)]
 
-    if "avg_gradient_pct" in seg_df.columns:
-        seg_df = seg_df[seg_df["avg_gradient_pct"].abs() >= float(min_abs_grad)]
+    if "avg_gradient" in seg_df.columns:
+        seg_df = seg_df[seg_df["avg_gradient"].abs() >= float(min_abs_grad)]
 
     if "distance_km" in seg_df.columns:
         seg_df = seg_df[seg_df["distance_km"] >= float(min_dist)]
@@ -381,8 +405,8 @@ with tab_strategy:
         st.markdown(readable)
     else:
         st.info(
-            "This run didn't include a separate narrative strategy. "
-            "Showing the structured plan below instead."
+            "Narrative strategy unavailable (JSON-only retry). "
+            "Showing structured strategy instead."
         )
 
     st.divider()

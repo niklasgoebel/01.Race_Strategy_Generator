@@ -1,7 +1,14 @@
-# in src/course_model.py
+# src/course_model.py
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Resampling
+# ---------------------------------------------------------------------------
 
 def resample_to_uniform(df_gpx: pd.DataFrame, step_m: float = 20.0) -> pd.DataFrame:
     """
@@ -18,7 +25,8 @@ def resample_to_uniform(df_gpx: pd.DataFrame, step_m: float = 20.0) -> pd.DataFr
     elev = df_gpx["elev_smooth"].to_numpy()
 
     total = dist[-1]
-    # include endpoint so the final distance is represented
+
+    # Include endpoint so the final distance is represented
     target = np.arange(0, total + step_m, step_m)
     target = target[target <= total]
 
@@ -26,29 +34,40 @@ def resample_to_uniform(df_gpx: pd.DataFrame, step_m: float = 20.0) -> pd.DataFr
     lon_u = np.interp(target, dist, lon)
     elev_u = np.interp(target, dist, elev)
 
-    return pd.DataFrame({
-        "cum_distance": target,
-        "lat": lat_u,
-        "lon": lon_u,
-        "elev_smooth": elev_u,
-    })
+    return pd.DataFrame(
+        {
+            "cum_distance": target,
+            "lat": lat_u,
+            "lon": lon_u,
+            "elev_smooth": elev_u,
+        }
+    )
 
+
+# ---------------------------------------------------------------------------
+# Gradient + segmentation
+# ---------------------------------------------------------------------------
 
 def compute_window_gradient(df_res: pd.DataFrame, window_m: float = 100.0) -> pd.DataFrame:
     dist = df_res["cum_distance"].to_numpy()
     elev = df_res["elev_smooth"].to_numpy()
-    grad = np.zeros_like(elev)
+
+    grad = np.zeros_like(elev, dtype=float)
 
     for i in range(len(dist)):
         target = dist[i] + window_m
         j = np.searchsorted(dist, target)
         if j >= len(dist):
             j = len(dist) - 1
+
         run = dist[j] - dist[i]
         rise = elev[j] - elev[i]
         grad[i] = (rise / run) * 100 if run > 0 else np.nan
 
-    df_res["gradient_final"] = pd.Series(grad).rolling(25, center=True, min_periods=1).median()
+    # Median smoothing to stabilize classification
+    df_res["gradient_final"] = (
+        pd.Series(grad).rolling(25, center=True, min_periods=1).median()
+    )
     return df_res
 
 
@@ -72,6 +91,7 @@ def add_segment_labels(df_res: pd.DataFrame) -> pd.DataFrame:
 
 def segments_from_labels(df_res: pd.DataFrame) -> pd.DataFrame:
     labels = df_res["segment_type_raw"].to_numpy()
+
     segments = []
     current = None
     start = 0
@@ -94,30 +114,36 @@ def segments_from_labels(df_res: pd.DataFrame) -> pd.DataFrame:
         g = df_res["gradient_final"]
 
         d0, d1 = dist.iloc[start], dist.iloc[end]
-        rows.append({
-            "type": typ,
-            "start_km": d0 / 1000,
-            "end_km": d1 / 1000,
-            "distance_km": (d1 - d0) / 1000,
-            "elev_change_m": elev.iloc[end] - elev.iloc[start],
-            "avg_gradient": g.iloc[start:end+1].mean(),
-            "points": end - start + 1,
-        })
+
+        rows.append(
+            {
+                "type": typ,
+                "start_km": d0 / 1000.0,
+                "end_km": d1 / 1000.0,
+                "distance_km": (d1 - d0) / 1000.0,
+                "elev_change_m": elev.iloc[end] - elev.iloc[start],
+                "avg_gradient": g.iloc[start : end + 1].mean(),
+                "points": end - start + 1,
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
 def merge_micro_segments(
-            segments_df: pd.DataFrame,
-            df_res: pd.DataFrame,
-            min_segment_km: float = 0.2,
-        ) -> pd.DataFrame:
-
+    segments_df: pd.DataFrame,
+    df_res: pd.DataFrame,
+    min_segment_km: float = 0.2,
+) -> pd.DataFrame:
     if segments_df.empty:
         return segments_df.copy()
 
     merged = []
     current = segments_df.iloc[0].copy()
+
+    cum = df_res["cum_distance"].to_numpy()
+    elev = df_res["elev_smooth"].to_numpy()
+    g = df_res["gradient_final"].to_numpy()
 
     for i in range(1, len(segments_df)):
         row = segments_df.iloc[i]
@@ -126,20 +152,14 @@ def merge_micro_segments(
             current["end_km"] = row["end_km"]
             current["distance_km"] = current["end_km"] - current["start_km"]
 
-            cum = df_res["cum_distance"].to_numpy()
-
             start_m = float(current["start_km"]) * 1000.0
             end_m = float(current["end_km"]) * 1000.0
 
             start_idx = int(np.searchsorted(cum, start_m, side="left"))
             end_idx = int(np.searchsorted(cum, end_m, side="right"))
 
-            # clamp to valid bounds
             start_idx = max(0, min(start_idx, len(cum) - 1))
             end_idx = max(start_idx + 1, min(end_idx, len(cum)))
-
-            elev = df_res["elev_smooth"].to_numpy()
-            g = df_res["gradient_final"].to_numpy()
 
             current["elev_change_m"] = float(elev[end_idx - 1] - elev[start_idx])
             current["avg_gradient"] = float(np.nanmean(g[start_idx:end_idx]))
@@ -151,6 +171,10 @@ def merge_micro_segments(
     return pd.DataFrame(merged)
 
 
+# ---------------------------------------------------------------------------
+# Enrichment + summaries
+# ---------------------------------------------------------------------------
+
 def enrich_segments(segments_df: pd.DataFrame) -> pd.DataFrame:
     seg = segments_df.copy()
     seg["gain_m"] = seg["elev_change_m"].clip(lower=0)
@@ -161,39 +185,58 @@ def enrich_segments(segments_df: pd.DataFrame) -> pd.DataFrame:
     return seg
 
 
-def extract_key_climbs(seg: pd.DataFrame,
-                       min_gain_m: float = 50.0,
-                       min_dist_km: float = 0.4,
-                       max_avg_gradient: float = 30.0) -> pd.DataFrame:
+def extract_key_climbs(
+    seg: pd.DataFrame,
+    min_gain_m: float = 50.0,
+    min_dist_km: float = 0.4,
+    max_avg_gradient: float = 30.0,
+) -> pd.DataFrame:
     climbs = seg[
-        (seg["is_climb"]) &
-        (seg["gain_m"] >= min_gain_m) &
-        (seg["distance_km"] >= min_dist_km) &
-        (seg["avg_gradient"].abs() <= max_avg_gradient)
+        (seg["is_climb"])
+        & (seg["gain_m"] >= min_gain_m)
+        & (seg["distance_km"] >= min_dist_km)
+        & (seg["avg_gradient"].abs() <= max_avg_gradient)
     ].copy()
+
     if climbs.empty:
         return climbs
 
-    climbs = climbs.sort_values(["gain_m", "avg_gradient"], ascending=[False, False])
-    climbs["rank_by_gain"] = climbs["gain_m"].rank(ascending=False, method="dense").astype(int)
+    climbs = climbs.sort_values(
+        ["gain_m", "avg_gradient"], ascending=[False, False]
+    )
+    climbs["rank_by_gain"] = (
+        climbs["gain_m"].rank(ascending=False, method="dense").astype(int)
+    )
     return climbs
 
 
-def summarize_course_overview(df_res: pd.DataFrame, seg: pd.DataFrame) -> dict:
+def summarize_course_overview(
+    df_res: pd.DataFrame,
+    seg: pd.DataFrame,
+    elevation_quality: dict | None = None,
+) -> dict:
     dist_km = df_res["cum_distance"].iloc[-1] / 1000.0
+
     elev = df_res["elev_smooth"].to_numpy()
     diffs = np.diff(elev)
+
     total_gain = diffs[diffs > 0].sum()
     total_loss = -diffs[diffs < 0].sum()
-    return {
+
+    summary = {
         "total_distance_km": round(float(dist_km), 1),
         "total_gain_m": int(total_gain),
         "total_loss_m": int(total_loss),
         "num_segments": int(len(seg)),
     }
 
+    if elevation_quality is not None:
+        summary["elevation_quality"] = elevation_quality
 
-def summarize_segments(seg: pd.DataFrame) -> list:
+    return summary
+
+
+def summarize_segments(seg: pd.DataFrame) -> list[str]:
     out = []
     for _, row in seg.iterrows():
         out.append(
@@ -204,7 +247,7 @@ def summarize_segments(seg: pd.DataFrame) -> list:
     return out
 
 
-def summarize_key_climbs(key_climbs: pd.DataFrame) -> list:
+def summarize_key_climbs(key_climbs: pd.DataFrame) -> list[str]:
     out = []
     for _, row in key_climbs.iterrows():
         out.append(
@@ -216,25 +259,40 @@ def summarize_key_climbs(key_climbs: pd.DataFrame) -> list:
     return out
 
 
-def build_full_course_model(df_gpx: pd.DataFrame,
-                            step_m: int = 20,
-                            window_m: int = 100,
-                            min_segment_km: float = 0.2):
+# ---------------------------------------------------------------------------
+# Pipeline entry
+# ---------------------------------------------------------------------------
+
+def build_full_course_model(
+    df_gpx: pd.DataFrame,
+    step_m: int = 20,
+    window_m: int = 100,
+    min_segment_km: float = 0.2,
+):
     """
     Assumes df_gpx already has:
       - cum_distance (m)
-      - elev_smooth (cleaned & smoothed as in Session 2)
+      - elev_smooth (robustly cleaned)
     """
     df_res = resample_to_uniform(df_gpx, step_m=step_m)
     df_res = compute_window_gradient(df_res, window_m=window_m)
     df_res = add_segment_labels(df_res)
 
     raw_segments = segments_from_labels(df_res)
-    merged_segments = merge_micro_segments(raw_segments, df_res, min_segment_km=min_segment_km)
+    merged_segments = merge_micro_segments(
+        raw_segments, df_res, min_segment_km=min_segment_km
+    )
+
     seg = enrich_segments(merged_segments)
     key_climbs = extract_key_climbs(seg)
 
-    course_summary = summarize_course_overview(df_res, seg)
+    elevation_quality = (
+        df_gpx.attrs.get("elevation_quality") if hasattr(df_gpx, "attrs") else None
+    )
+
+    course_summary = summarize_course_overview(
+        df_res, seg, elevation_quality=elevation_quality
+    )
     segment_summaries = summarize_segments(seg)
     climb_summaries = summarize_key_climbs(key_climbs)
 

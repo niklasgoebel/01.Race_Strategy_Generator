@@ -1,0 +1,19 @@
+# Testing
+pytest
+
+# Formatting / linting
+black
+ruff
+
+# Jupyter / notebooks
+jupyterlab
+ipykernel
+notebook
+
+# Git / tooling
+GitPython
+
+# Visualization extras (used by Streamlit internally, safe here)
+pydeck
+
+watchdog

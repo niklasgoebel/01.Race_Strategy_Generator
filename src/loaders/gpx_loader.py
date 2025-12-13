@@ -1,19 +1,14 @@
-# src/loaders/gpx_loader.py
-
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import gpxpy
 import numpy as np
 import pandas as pd
 
-from src.utils.geo import (
-    compute_step_and_cum_distance,
-    apply_elevation_floor_interpolate,
-    savgol_smooth,
-    ensure_strictly_increasing,
-)
+from src.elevation import clean_elevation
+from src.utils.geo import compute_step_and_cum_distance, ensure_strictly_increasing
+
 
 def _parse_gpx_to_points(gpx_file_path: str) -> pd.DataFrame:
     """
@@ -43,7 +38,6 @@ def _parse_gpx_to_points(gpx_file_path: str) -> pd.DataFrame:
 
 def load_gpx_to_df(
     gpx_file_path: str,
-    elevation_floor_m: float = 200.0,
     window_length: int = 13,
     polyorder: int = 3,
 ) -> pd.DataFrame:
@@ -52,19 +46,39 @@ def load_gpx_to_df(
 
     Returns df with:
       - lat, lon, time
-      - elev_raw, elev_clean, elev_smooth
+      - elev_raw, elev_smooth
       - step_distance, cum_distance (meters)
+
+    Also attaches df.attrs["elevation_quality"] with cleaning diagnostics.
     """
     df = _parse_gpx_to_points(gpx_file_path)
 
-    df["elev_raw"] = df["elev"].astype(float)
+    # --- raw elevation ---
+    df["elev_raw"] = pd.to_numeric(df["elev"], errors="coerce").astype(float)
 
-    # Distance (meters)
+    # --- distance (meters) ---
     df = compute_step_and_cum_distance(df)
-    df["cum_distance"] = ensure_strictly_increasing(df["cum_distance"])
+    df["cum_distance"] = ensure_strictly_increasing(
+        pd.to_numeric(df["cum_distance"], errors="coerce").astype(float)
+    )
 
-    # Elevation cleaning
-    df["elev_clean"] = apply_elevation_floor_interpolate(df["elev_raw"], elevation_floor_m=elevation_floor_m)
-    df["elev_smooth"] = savgol_smooth(df["elev_clean"], window_length=window_length, polyorder=polyorder)
+    # --- elevation cleaning (robust: spikes, zero runs, missing) ---
+    elev_smooth, quality = clean_elevation(
+        df,
+        elev_col="elev_raw",
+        dist_col="cum_distance",
+        savgol_window_length=int(window_length),
+        savgol_polyorder=int(polyorder),
+        apply_savgol=True,
+    )
+
+    # IMPORTANT: ensure alignment + numeric dtype
+    df["elev_smooth"] = (
+        pd.Series(elev_smooth, index=df.index)
+        .astype(float)
+    )
+
+    # --- attach diagnostics for downstream UI / prompting ---
+    df.attrs["elevation_quality"] = quality
 
     return df

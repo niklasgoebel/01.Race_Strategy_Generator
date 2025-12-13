@@ -1,5 +1,3 @@
-# src/pipeline.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,13 +20,17 @@ from src.outputs.output_formatter import (
 @dataclass
 class PipelineConfig:
     gpx_path: str
-    elevation_floor_m: float = 200.0
+
+    # elevation smoothing controls (advanced)
     savgol_window_length: int = 13
     savgol_polyorder: int = 3
 
     # model controls
     llm_model: str = "gpt-4.1-mini"
     llm_max_output_tokens: int = 2000
+
+    # hard skip (for tests / dev)
+    skip_llm: bool = False
 
     # JSON-only mode is for retries only, not initial generation
     llm_json_only: bool = False
@@ -39,10 +41,8 @@ class PipelineConfig:
 
 @dataclass
 class PipelineResult:
-    # raw data
     df_gpx: pd.DataFrame
 
-    # course model
     df_res: pd.DataFrame
     seg: Any
     key_climbs: pd.DataFrame
@@ -50,11 +50,9 @@ class PipelineResult:
     segment_summaries: list[str]
     climb_summaries: list[str]
 
-    # strategy
     strategy_text: str
     strategy_data: Dict[str, Any]
 
-    # formatted outputs (nice for UI)
     overview_df: pd.DataFrame
     segments_df: pd.DataFrame
     climbs_df: pd.DataFrame
@@ -67,43 +65,49 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     This is what the notebook / web app / CLI should call.
     """
 
-    # 1) Load + clean GPX
+    # 1) Load + clean GPX (robust elevation handling)
     df_gpx = load_gpx_to_df(
         cfg.gpx_path,
-        elevation_floor_m=cfg.elevation_floor_m,
         window_length=cfg.savgol_window_length,
         polyorder=cfg.savgol_polyorder,
     )
 
-    # 2) Build full course model (segmentation, climbs, summaries)
+    # 2) Build full course model
     df_res, seg, key_climbs, course_summary, segment_summaries, climb_summaries = (
         build_full_course_model(df_gpx)
     )
 
-    # 3) Generate strategy from LLM
-    athlete_profile = get_default_athlete_profile()
-    # Always generate FULL strategy on initial pipeline run
-    strategy_text, strategy_data = generate_race_strategy(
-        course_summary=course_summary,
-        segment_summaries=segment_summaries,
-        climb_summaries=climb_summaries,
-        athlete_profile=athlete_profile,
-        model=cfg.llm_model,
-        max_output_tokens=cfg.llm_max_output_tokens,
-        json_only=False,
-        verbose=cfg.llm_verbose,
-    )
-    # generate_race_strategy now raises if JSON can't be parsed, so strategy_data is guaranteed here.
+    # Make elevation diagnostics available downstream
+    if isinstance(course_summary, dict) and "elevation_quality" not in course_summary:
+        eq = getattr(df_gpx, "attrs", {}).get("elevation_quality")
+        if eq is not None:
+            course_summary["elevation_quality"] = eq
+
+    # 3) Strategy (LLM or skipped)
+    strategy_text = ""
+    strategy_data: Dict[str, Any] = {}
+    strategy_tables: Dict[str, pd.DataFrame] = {}
+
+    should_skip = bool(cfg.skip_llm) or (str(cfg.llm_model).upper() == "SKIP")
+
+    if not should_skip:
+        athlete_profile = get_default_athlete_profile()
+        strategy_text, strategy_data = generate_race_strategy(
+            course_summary=course_summary,
+            segment_summaries=segment_summaries,
+            climb_summaries=climb_summaries,
+            athlete_profile=athlete_profile,
+            model=cfg.llm_model,
+            max_output_tokens=cfg.llm_max_output_tokens,
+            json_only=bool(cfg.llm_json_only),
+            verbose=cfg.llm_verbose,
+        )
+        strategy_tables = make_strategy_tables(strategy_data)
 
     # 4) Format outputs (tables for UI)
     overview_df = make_course_overview_table(course_summary)
-
-    # IMPORTANT: output_formatter expects the enriched segments DataFrame ("seg"),
-    # not the point-by-point df_res.
     segments_df = make_segments_table(seg)
     climbs_df = make_key_climbs_table(key_climbs)
-
-    strategy_tables = make_strategy_tables(strategy_data)
 
     return PipelineResult(
         df_gpx=df_gpx,
