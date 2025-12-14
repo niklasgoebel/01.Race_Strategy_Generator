@@ -5,16 +5,17 @@ from typing import Any, Dict
 
 import pandas as pd
 
-from src.loaders.gpx_loader import load_gpx_to_df
-from src.course_model import build_full_course_model
 from src.athlete_profile import get_default_athlete_profile
-from src.race_strategy_generator import generate_race_strategy
+from src.course_model import build_full_course_model
+from src.effort_blocks import summarize_climb_blocks
+from src.loaders.gpx_loader import load_gpx_to_df
 from src.outputs.output_formatter import (
     make_course_overview_table,
-    make_segments_table,
     make_key_climbs_table,
+    make_segments_table,
     make_strategy_tables,
 )
+from src.race_strategy_generator import generate_race_strategy
 
 
 @dataclass
@@ -41,18 +42,25 @@ class PipelineConfig:
 
 @dataclass
 class PipelineResult:
+    # raw + cleaned data
     df_gpx: pd.DataFrame
 
+    # course model
     df_res: pd.DataFrame
     seg: Any
     key_climbs: pd.DataFrame
+    climb_blocks: pd.DataFrame
+
     course_summary: Dict[str, Any]
     segment_summaries: list[str]
     climb_summaries: list[str]
+    climb_block_summaries: list[str]
 
+    # strategy
     strategy_text: str
     strategy_data: Dict[str, Any]
 
+    # formatted outputs (UI)
     overview_df: pd.DataFrame
     segments_df: pd.DataFrame
     climbs_df: pd.DataFrame
@@ -73,12 +81,28 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     )
 
     # 2) Build full course model
-    df_res, seg, key_climbs, course_summary, segment_summaries, climb_summaries = (
-        build_full_course_model(df_gpx)
-    )
+    (
+        df_res,
+        seg,
+        key_climbs,
+        climb_blocks,
+        course_summary,
+        segment_summaries,
+        climb_summaries,
+    ) = build_full_course_model(df_gpx)
 
-    # Make elevation diagnostics available downstream
-    if isinstance(course_summary, dict) and "elevation_quality" not in course_summary:
+    # Defensive: ensure we always have a DataFrame
+    if climb_blocks is None:
+        climb_blocks = pd.DataFrame()
+
+    climb_block_summaries = summarize_climb_blocks(climb_blocks, max_items=10)
+
+    # Attach climb-block summary to course_summary for downstream prompt/UI
+    course_summary["climb_blocks_top"] = climb_block_summaries
+    course_summary["num_climb_blocks"] = int(len(climb_blocks))
+
+    # Make elevation diagnostics available downstream (from df_gpx.attrs)
+    if "elevation_quality" not in course_summary:
         eq = getattr(df_gpx, "attrs", {}).get("elevation_quality")
         if eq is not None:
             course_summary["elevation_quality"] = eq
@@ -96,6 +120,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
             course_summary=course_summary,
             segment_summaries=segment_summaries,
             climb_summaries=climb_summaries,
+            climb_block_summaries=climb_block_summaries,
             athlete_profile=athlete_profile,
             model=cfg.llm_model,
             max_output_tokens=cfg.llm_max_output_tokens,
@@ -114,9 +139,11 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         df_res=df_res,
         seg=seg,
         key_climbs=key_climbs,
+        climb_blocks=climb_blocks,
         course_summary=course_summary,
         segment_summaries=segment_summaries,
         climb_summaries=climb_summaries,
+        climb_block_summaries=climb_block_summaries,
         strategy_text=strategy_text,
         strategy_data=strategy_data,
         overview_df=overview_df,

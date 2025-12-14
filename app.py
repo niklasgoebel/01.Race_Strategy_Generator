@@ -1,8 +1,6 @@
-# app.py
 from __future__ import annotations
 
 import hashlib
-import re
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
@@ -11,10 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
-from src.pipeline import PipelineResult
 from src.athlete_profile import get_default_athlete_profile
-from src.race_strategy_generator import generate_race_strategy
 from src.outputs.output_formatter import make_strategy_tables
+from src.pipeline import PipelineResult
+from src.race_strategy_generator import generate_race_strategy
 
 
 # -------------------------
@@ -40,7 +38,7 @@ def cached_full_run(
     NOTE: this caches the LLM call too (good for cost + speed),
     but means identical inputs will reuse the same output.
     """
-    from src.pipeline import run_pipeline, PipelineConfig  # local import keeps cache stable
+    from src.pipeline import PipelineConfig, run_pipeline  # local import keeps cache stable
 
     with tempfile.TemporaryDirectory() as tmpdir:
         gpx_path = Path(tmpdir) / filename
@@ -54,43 +52,6 @@ def cached_full_run(
             llm_max_output_tokens=int(llm_max_output_tokens),
         )
         return run_pipeline(cfg)
-
-
-def _split_readable_and_json(text: str) -> Tuple[str, str]:
-    """
-    Split combined model output into:
-      - readable narrative (coach notes)
-      - JSON tail (optional)
-
-    Handles:
-      - ```json ...``` fenced output
-      - narrative + JSON appended
-      - PART 1 / PART 2 headings
-    """
-    if not text:
-        return "", ""
-
-    t = text.strip()
-
-    m = re.search(r"```json\s*(\{.*?\})\s*```", t, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        json_part = m.group(1).strip()
-        readable = (t[: m.start()] + t[m.end() :]).strip()
-    else:
-        idx = t.find("{")
-        if idx != -1:
-            readable = t[:idx].strip()
-            json_part = t[idx:].strip()
-        else:
-            readable, json_part = t, ""
-
-    readable = re.sub(r"(?im)^\s*PART\s*1\s*—.*$", "", readable).strip()
-    readable = re.sub(r"(?im)^\s*PART\s*2\s*—.*$", "", readable).strip()
-
-    if readable.startswith("{") or readable.startswith("[") or "{\n" in readable:
-        readable = ""
-
-    return readable, json_part
 
 
 def _init_state() -> None:
@@ -190,6 +151,16 @@ def _retry_llm_only() -> Tuple[Optional[PipelineResult], Optional[str]]:
 
     athlete_profile = get_default_athlete_profile()
 
+    # Pull climb-block summaries if present (new feature)
+    climb_block_summaries = []
+    if hasattr(res, "climb_block_summaries") and isinstance(res.climb_block_summaries, list):
+        climb_block_summaries = res.climb_block_summaries
+    else:
+        # fallback if stored only in course_summary
+        cbs = res.course_summary.get("climb_blocks_top") if isinstance(res.course_summary, dict) else None
+        if isinstance(cbs, list):
+            climb_block_summaries = cbs
+
     try:
         with st.spinner("Retrying strategy generation (LLM only)..."):
             # JSON-only retry: robust & consistent parsing
@@ -197,6 +168,7 @@ def _retry_llm_only() -> Tuple[Optional[PipelineResult], Optional[str]]:
                 course_summary=res.course_summary,
                 segment_summaries=res.segment_summaries,
                 climb_summaries=res.climb_summaries,
+                climb_block_summaries=climb_block_summaries,
                 athlete_profile=athlete_profile,
                 model=str(llm_model),
                 max_output_tokens=int(llm_max_output_tokens),
@@ -213,6 +185,9 @@ def _retry_llm_only() -> Tuple[Optional[PipelineResult], Optional[str]]:
     return res, None
 
 
+# -------------------------
+# Control flow
+# -------------------------
 error_msg = None
 
 if gpx_file is None and st.session_state["last_result"] is None:
@@ -259,7 +234,6 @@ with tab_course:
     st.subheader("Course overview")
     st.dataframe(result.overview_df, use_container_width=True)
 
-    # Elevation quality warnings (from robust elevation cleaner)
     eq = result.course_summary.get("elevation_quality") if isinstance(result.course_summary, dict) else None
     if isinstance(eq, dict):
         missing_frac = float(eq.get("missing_frac", 0.0) or 0.0)
@@ -270,9 +244,7 @@ with tab_course:
         if missing_frac > 0.05:
             st.warning(f"Elevation data has gaps (missing ~{missing_frac*100:.1f}%). Climb precision may be reduced.")
         if spike_frac > 0.01 or spikes_fixed > 0:
-            st.warning(
-                f"Elevation data appears noisy/spiky (fixed {spikes_fixed} points; spike ~{spike_frac*100:.1f}%)."
-            )
+            st.warning(f"Elevation data appears noisy/spiky (fixed {spikes_fixed} points; spike ~{spike_frac*100:.1f}%).")
         if notes and notes != "ok":
             st.caption(f"Elevation diagnostics: {notes}")
 
@@ -284,42 +256,35 @@ with tab_course:
         st.stop()
 
     x_km = df["cum_distance"].to_numpy(dtype=float) / 1000.0
-
-    # Prefer smoothed elevation, fallback to raw
-    elev = (
-        df["elev_smooth"].to_numpy(dtype=float)
-        if "elev_smooth" in df.columns
-        else df["elev_raw"].to_numpy(dtype=float)
-    )
+    elev_smooth = df["elev_smooth"].to_numpy(dtype=float) if "elev_smooth" in df.columns else None
+    elev_raw = df["elev_raw"].to_numpy(dtype=float) if "elev_raw" in df.columns else None
 
     fig, ax = plt.subplots()
 
-    # Optional debug overlay: raw elevation
-    if show_debug and "elev_raw" in df.columns:
-        ax.plot(
-            x_km,
-            df["elev_raw"].to_numpy(dtype=float),
-            alpha=0.35,
-            label="raw",
-        )
+    if show_debug and elev_raw is not None:
+        ax.plot(x_km, elev_raw, alpha=0.35, label="raw")
 
-    ax.plot(x_km, elev, linewidth=2, label="smooth" if show_debug else None)
+    if elev_smooth is not None:
+        ax.plot(x_km, elev_smooth, linewidth=2, label="smooth" if show_debug else None)
+    else:
+        ax.plot(x_km, elev_raw, linewidth=2, label="raw" if show_debug else None)
+
     ax.set_xlabel("Distance (km)")
     ax.set_ylabel("Elevation (m)")
+
     if show_debug:
         ax.legend()
-
         dd = np.diff(df["cum_distance"].to_numpy(dtype=float))
         st.caption(f"Step distance percentiles (m): {np.percentile(dd, [1, 5, 50, 95, 99])}")
-
         if isinstance(eq, dict):
             st.caption(f"Elevation quality dict: {eq}")
 
     st.pyplot(fig, clear_figure=True)
 
     st.subheader("Gradient (approx)")
+    elev_for_grad = elev_smooth if elev_smooth is not None else elev_raw
     dx_m = np.gradient(df["cum_distance"].to_numpy(dtype=float))
-    de_m = np.gradient(elev)
+    de_m = np.gradient(elev_for_grad)
 
     grad_pct = (de_m / dx_m) * 100.0
     grad_pct = np.clip(grad_pct, -40, 40)
@@ -385,6 +350,12 @@ with tab_segments:
     st.markdown("### Key climbs")
     st.dataframe(result.climbs_df, use_container_width=True)
 
+    st.subheader("Climb blocks (sustained efforts)")
+    if hasattr(result, "climb_blocks") and result.climb_blocks is not None and not result.climb_blocks.empty:
+        st.dataframe(result.climb_blocks, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No climb blocks detected.")
+
 with tab_strategy:
     st.subheader("Race strategy")
     data = result.strategy_data or {}
@@ -396,16 +367,13 @@ with tab_strategy:
         st.markdown(f"**{title}**")
         st.write(body if body else "—")
 
-    raw_text = (result.strategy_text or "").strip()
-    readable, _json_tail = _split_readable_and_json(raw_text)
-    readable = _safe_text(readable)
-
     st.markdown("### Coach notes")
-    if readable:
-        st.markdown(readable)
+    coach_notes = _safe_text(result.strategy_text)
+    if coach_notes and not coach_notes.lstrip().startswith("{"):
+        st.markdown(coach_notes)
     else:
         st.info(
-            "Narrative strategy unavailable (JSON-only retry). "
+            "Coach notes not available (likely a JSON-only retry). "
             "Showing structured strategy instead."
         )
 
@@ -422,30 +390,19 @@ with tab_strategy:
         with c3:
             _show_card("🔴 Late", _safe_text(gs.get("late")))
     else:
-        st.warning(
-            "Structured strategy (global_strategy) missing. "
-            "Try **Retry strategy only (LLM)** with higher token limit."
-        )
+        st.warning("Structured strategy (global_strategy) missing. Try **Retry strategy only (LLM)** with higher token limit.")
 
     st.divider()
 
     st.markdown("### Critical sections")
     if result.strategy_tables and "critical_sections" in result.strategy_tables:
-        st.dataframe(
-            result.strategy_tables["critical_sections"],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(result.strategy_tables["critical_sections"], use_container_width=True, hide_index=True)
     else:
         st.info("No critical sections table available for this run.")
 
     st.markdown("### Pacing chunks")
     if result.strategy_tables and "pacing_chunks" in result.strategy_tables:
-        st.dataframe(
-            result.strategy_tables["pacing_chunks"],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(result.strategy_tables["pacing_chunks"], use_container_width=True, hide_index=True)
     else:
         st.info("No pacing chunks table available for this run.")
 
@@ -455,8 +412,7 @@ with tab_strategy:
     with colA:
         st.markdown("### Fueling target")
         fp = (data.get("fueling_plan") or {}) if isinstance(data, dict) else {}
-        carbs = fp.get("carbs_g_per_hour", "—")
-        st.metric("Carbs (g/hr)", carbs)
+        st.metric("Carbs (g/hr)", fp.get("carbs_g_per_hour", "—"))
 
     with colB:
         st.markdown("### Mental cue (preview)")
@@ -479,7 +435,7 @@ with tab_fueling:
 
     st.markdown("### Fueling plan")
     if not fp:
-        st.info("No fueling_plan found (likely JSON parse failed).")
+        st.info("No fueling_plan found.")
     else:
         col1, col2 = st.columns([1, 3])
         with col1:
@@ -501,7 +457,7 @@ with tab_fueling:
 
     st.markdown("### Mental cues")
     if not cues:
-        st.info("No mental_cues found (likely JSON parse failed).")
+        st.info("No mental_cues found.")
     else:
         for c in cues:
             st.markdown(f"- **km {c.get('km','?')}**: {c.get('cue','')}")

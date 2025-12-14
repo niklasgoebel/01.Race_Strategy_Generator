@@ -1,20 +1,15 @@
-# src/race_strategy_generator.py
-
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from openai import OpenAI, BadRequestError
+from openai import BadRequestError, OpenAI
 
 # (Optional) useful for demos/tests
 from .athlete_profile import get_default_athlete_profile  # noqa: F401
 
-# Load environment variables from .env (including OPENAI_API_KEY)
 load_dotenv()
-
-# OpenAI client – reads OPENAI_API_KEY from environment by default
 client = OpenAI()
 
 
@@ -26,6 +21,7 @@ def build_strategy_prompt(
     course_summary: Dict[str, Any],
     segment_summaries: List[str],
     climb_summaries: List[str],
+    climb_block_summaries: List[str],
     athlete_profile: Dict[str, Any],
     *,
     json_only: bool = False,
@@ -33,19 +29,18 @@ def build_strategy_prompt(
     """
     Build a structured prompt for the LLM.
 
-    If json_only=True, we instruct the model to output ONLY valid JSON.
-    Otherwise, we ask for a readable narrative first, then JSON.
+    If json_only=True, instruct the model to output ONLY valid JSON.
+    Otherwise, ask for coach notes (human) then JSON (machine).
     """
-
     max_segments = 40
-    segment_text = "\n".join(segment_summaries[:max_segments])
+    segment_text = "\n".join(segment_summaries[:max_segments]) if segment_summaries else "—"
 
     max_climbs = 10
-    climb_text = "\n".join(climb_summaries[:max_climbs])
+    climb_text = "\n".join(climb_summaries[:max_climbs]) if climb_summaries else "—"
 
-    # ---------------------
-    # JSON SCHEMA DESIGN
-    # ---------------------
+    max_blocks = 10
+    climb_blocks_text = "\n".join(climb_block_summaries[:max_blocks]) if climb_block_summaries else "—"
+
     json_schema = """
 {
   "global_strategy": {
@@ -97,15 +92,13 @@ def build_strategy_prompt(
     }
   ]
 }
-"""
+""".strip()
 
     common_context = f"""
 You are an experienced ultra-trail running coach and race strategist.
 
-You are helping an athlete plan their race strategy for the following event:
-
 RACE
-- Name: {course_summary.get("race_name", "Chianti Ultra Trail 75 km")}
+- Name: {course_summary.get("race_name", "Race")}
 - Distance: {course_summary.get("total_distance_km")} km
 - Total elevation gain: {course_summary.get("total_gain_m")} m
 - Total elevation loss: {course_summary.get("total_loss_m")} m
@@ -131,17 +124,34 @@ Each row:
 
 KEY CLIMBS (MOST IMPORTANT FEATURES)
 {climb_text}
-"""
 
-    task_block_two_part = """
+CLIMB BLOCKS (SUSTAINED EFFORT STRUCTURE)
+These represent sustained climbing efforts that may include SHORT runnable interruptions.
+IMPORTANT: Treat these as continuous “costly” effort with LIMITED recovery.
+
+{climb_blocks_text}
+""".strip()
+
+    if json_only:
+        task_block = f"""
 TASK
+You MUST output ONLY a valid JSON object following the schema below.
+- No markdown fences. No extra commentary. Only JSON.
+- Use double quotes for all strings.
+- No trailing commas.
 
+Return EXACTLY this schema (same keys, same nesting, same field types):
+{json_schema}
+""".strip()
+    else:
+        task_block = f"""
+TASK
 You MUST output in TWO PARTS, in this exact order:
 
 PART 1 — COACH NOTES (human-readable)
-- Write 10–15 bullet points.
+- Write 6–12 bullet points.
 - Short, concrete, actionable.
-- Reference specific course sections (km ranges, key climbs).
+- Reference specific course sections (km ranges, climbs, climb blocks).
 - Include pacing guidance using RPE + % of max HR.
 - Include fueling reminders where relevant.
 - Do NOT include any JSON, braces, or code blocks in Part 1.
@@ -149,66 +159,21 @@ PART 1 — COACH NOTES (human-readable)
 PART 2 — JSON (machine-readable)
 - On a new line after Part 1, output ONLY a valid JSON object following the schema below.
 - No markdown fences. No extra commentary. Only JSON.
-"""
-
-    task_block_json_only = """
-TASK
-
-You MUST output ONLY a valid JSON object following the schema below.
-- No markdown fences. No extra commentary. Only JSON.
 - Use double quotes for all strings.
 - No trailing commas.
-"""
-
-    if json_only:
-        output_block = f"""
-OUTPUT INSTRUCTION
-- Output ONLY a JSON object.
-- The JSON MUST be valid and parsable.
-- Use double quotes for all strings.
-- No trailing commas.
-- Do not wrap JSON in backticks or Markdown.
-
-Return EXACTLY this schema (same keys, same nesting, same field types):
-{json_schema}
-"""
-    else:
-        output_block = f"""
-OUTPUT INSTRUCTION
-
-1) First, write a clear, concise, human-readable race strategy covering:
-   - how to approach the early / mid / late parts of the race,
-   - where to be patient vs where to be brave,
-   - how to tackle the major climbs and technical descents,
-   - how to think about effort (RPE and % of max HR),
-   - basic fueling/hydration guidance.
-
-2) Then, on a new line, output ONLY a JSON object.
-
-IMPORTANT:
-- The JSON MUST be valid and parsable.
-- Use double quotes for all strings.
-- No trailing commas.
-- Do not wrap the JSON in backticks or Markdown.
 
 JSON schema:
 {json_schema}
-"""
+""".strip()
 
-    task_block = task_block_json_only if json_only else task_block_two_part
-    return f"{common_context}\n{task_block}\n{output_block}".strip()
+    return f"{common_context}\n\n{task_block}".strip()
+
 
 # ---------------------------------------------------------------------------
 # JSON extraction helper
 # ---------------------------------------------------------------------------
 
 def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Try to locate and parse a JSON object inside a larger text response.
-
-    Handles cases where the model wraps JSON in ```json ... ``` fences.
-    Returns None if parsing fails.
-    """
     cleaned = text.strip()
 
     # Handle ```json ... ``` style wrapping
@@ -236,12 +201,6 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _response_text_from_responses_api(response: Any) -> str:
-    """
-    Extract text from OpenAI Responses API response.
-
-    Expected structure:
-      response.output[0].content[0].text
-    """
     output = getattr(response, "output", None)
     if not output or not output[0].content:
         raise RuntimeError(f"No usable 'output' in OpenAI response: {response}")
@@ -256,6 +215,7 @@ def generate_race_strategy(
     course_summary: Dict[str, Any],
     segment_summaries: List[str],
     climb_summaries: List[str],
+    climb_block_summaries: List[str],
     athlete_profile: Dict[str, Any],
     *,
     json_only: bool = False,
@@ -263,17 +223,11 @@ def generate_race_strategy(
     max_output_tokens: int = 3500,
     verbose: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Generate a race strategy using the OpenAI Responses API.
-
-    Returns:
-      - raw_text: the model output text (JSON-only if json_only=True)
-      - parsed_json: structured JSON object (raises if missing/unparsable)
-    """
     prompt = build_strategy_prompt(
         course_summary=course_summary,
         segment_summaries=segment_summaries,
         climb_summaries=climb_summaries,
+        climb_block_summaries=climb_block_summaries,
         athlete_profile=athlete_profile,
         json_only=json_only,
     )
@@ -282,15 +236,13 @@ def generate_race_strategy(
         response = client.responses.create(
             model=model,
             input=[
-              {"role": "system", "content": "You are an expert ultra-trail running coach and race strategist."},
-              {"role": "user", "content": prompt},
+                {"role": "system", "content": "You are an expert ultra-trail running coach and race strategist."},
+                {"role": "user", "content": prompt},
             ],
             max_output_tokens=max_output_tokens,
         )
     except BadRequestError as e:
-        raise RuntimeError(
-            f"OpenAI BadRequestError: {getattr(e, 'message', str(e))}"
-        ) from e
+        raise RuntimeError(f"OpenAI BadRequestError: {getattr(e, 'message', str(e))}") from e
 
     if verbose:
         print("OpenAI response id:", getattr(response, "id", None))
@@ -298,41 +250,18 @@ def generate_race_strategy(
     raw_text = _response_text_from_responses_api(response)
     parsed_json = _extract_json_from_text(raw_text)
 
-    # Extract coach notes (only when not json_only)
-    strategy_text: Optional[str] = None
-
-    if not json_only:
-        # Everything before the first JSON object is considered coach notes
-        first_brace = raw_text.find("{")
-        if first_brace > 0:
-            strategy_text = raw_text[:first_brace].strip()
-        else:
-            strategy_text = raw_text.strip()
-
     if parsed_json is None:
-        # Fail loudly so pipeline doesn't silently produce empty tables
         raise RuntimeError(
             "LLM did not return parsable JSON. "
             "Try increasing max_output_tokens or inspect raw_text."
         )
 
-    if not json_only and not strategy_text:
-      raise RuntimeError(
-        "Full strategy generation did not produce coach notes. "
-        "This should never happen."
-      )
+    # Coach notes: only for non-json-only runs
+    coach_notes = ""
+    if not json_only:
+        first_brace = raw_text.find("{")
+        coach_notes = raw_text[:first_brace].strip() if first_brace > 0 else raw_text.strip()
+        if not coach_notes:
+            raise RuntimeError("Full strategy generation did not produce coach notes.")
 
-    return strategy_text or raw_text, parsed_json
-
-# ---------------------------------------------------------------------------
-# Simple CLI-style demo (optional)
-# ---------------------------------------------------------------------------
-
-def main_demo() -> None:
-    print("race_strategy_generator.py is intended to be imported, not run directly.")
-    print("Use generate_race_strategy(course_summary, segment_summaries, "
-          "climb_summaries, athlete_profile).")
-
-
-if __name__ == "__main__":
-    main_demo()
+    return (coach_notes if not json_only else raw_text), parsed_json
