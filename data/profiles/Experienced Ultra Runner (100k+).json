@@ -1,0 +1,21 @@
+{
+  "name": "Experienced Ultra Runner (100k+)",
+  "target_race": "100k+ ultra",
+  "race_date": "",
+  "experience": "Experienced (multiple ultras)",
+  "weekly_volume_km": 90,
+  "long_run_km": 35,
+  "vo2max": 55,
+  "max_hr": 188,
+  "lactate_threshold_hr": 173,
+  "lactate_threshold_pace_per_km": "4:15",
+  "recent_best_5k": "19:30",
+  "recent_best_half_marathon": "1:32:00",
+  "preferred_ascent_effort": "steady, push on longer climbs but stay aerobic",
+  "descent_style": "confident and efficient, can make up time",
+  "heat_tolerance": "good, experienced with heat management",
+  "goal_type": "Strong performance",
+  "fuel_type": "Mixed (gels, bars, real food)",
+  "carbs_per_hour_target_g": 75,
+  "hydration_notes": "soft flasks + vest, experienced with hydration strategy"
+}

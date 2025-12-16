@@ -38,8 +38,8 @@ def _parse_gpx_to_points(gpx_file_path: str) -> pd.DataFrame:
 
 def load_gpx_to_df(
     gpx_file_path: str,
-    window_length: int = 13,
-    polyorder: int = 3,
+    window_length: int = None,
+    polyorder: int = None,
 ) -> pd.DataFrame:
     """
     High-level GPX → DataFrame loader.
@@ -50,6 +50,9 @@ def load_gpx_to_df(
       - step_distance, cum_distance (meters)
 
     Also attaches df.attrs["elevation_quality"] with cleaning diagnostics.
+    
+    Note: Smoothing parameters are automatically determined based on data characteristics
+    unless explicitly provided.
     """
     df = _parse_gpx_to_points(gpx_file_path)
 
@@ -63,13 +66,17 @@ def load_gpx_to_df(
     )
 
     # --- elevation cleaning (robust: spikes, zero runs, missing) ---
+    # Use adaptive smoothing by default (auto-determines parameters from data characteristics)
+    use_auto_smoothing = (window_length is None or polyorder is None)
+    
     elev_smooth, quality = clean_elevation(
         df,
         elev_col="elev_raw",
         dist_col="cum_distance",
-        savgol_window_length=int(window_length),
-        savgol_polyorder=int(polyorder),
+        savgol_window_length=int(window_length) if window_length is not None else None,
+        savgol_polyorder=int(polyorder) if polyorder is not None else None,
         apply_savgol=True,
+        auto_smoothing=use_auto_smoothing,
     )
 
     # IMPORTANT: ensure alignment + numeric dtype

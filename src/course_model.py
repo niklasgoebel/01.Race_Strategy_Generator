@@ -41,6 +41,7 @@ def resample_to_uniform(df_gpx: pd.DataFrame, step_m: float = 20.0) -> pd.DataFr
 
 
 def compute_window_gradient(df_res: pd.DataFrame, window_m: float = 100.0) -> pd.DataFrame:
+    """Compute gradient at a single window size."""
     dist = df_res["cum_distance"].to_numpy(dtype=float)
     elev = df_res["elev_smooth"].to_numpy(dtype=float)
     grad = np.zeros_like(elev, dtype=float)
@@ -61,20 +62,121 @@ def compute_window_gradient(df_res: pd.DataFrame, window_m: float = 100.0) -> pd
     return df_res
 
 
+def compute_multiscale_gradients(
+    df_res: pd.DataFrame,
+    windows: list = None,
+    include_variability: bool = True
+) -> pd.DataFrame:
+    """
+    Compute gradients at multiple scales for richer terrain analysis.
+    
+    Helps detect:
+    - Short steep pitches within longer climbs (50m window)
+    - Overall climb trends (500m+ windows)
+    - Gradient consistency/variability
+    
+    Args:
+        df_res: Resampled dataframe with elevation data
+        windows: List of window sizes in meters (default: [50, 100, 500, 1000])
+        include_variability: Whether to compute gradient variability metric
+    
+    Returns:
+        DataFrame with additional gradient columns
+    """
+    if windows is None:
+        windows = [50, 100, 500, 1000]
+    
+    dist = df_res["cum_distance"].to_numpy(dtype=float)
+    elev = df_res["elev_smooth"].to_numpy(dtype=float)
+    
+    # Compute gradient at each window size
+    for window_m in windows:
+        grad = np.zeros_like(elev, dtype=float)
+        
+        for i in range(len(dist)):
+            target = dist[i] + window_m
+            j = np.searchsorted(dist, target)
+            if j >= len(dist):
+                j = len(dist) - 1
+            run = dist[j] - dist[i]
+            rise = elev[j] - elev[i]
+            grad[i] = (rise / run) * 100.0 if run > 0 else np.nan
+        
+        # Apply light smoothing
+        smoothed = pd.Series(grad).rolling(15, center=True, min_periods=1).median()
+        df_res[f"gradient_{window_m}m"] = smoothed
+    
+    # Compute gradient variability (how much it changes)
+    if include_variability and "gradient_50m" in df_res.columns:
+        # Standard deviation of 50m gradient over a rolling window
+        df_res["gradient_variability"] = (
+            df_res["gradient_50m"].rolling(40, center=True, min_periods=5).std()
+        )
+    
+    return df_res
+
+
 # -------------------------
 # Labeling (3-class: climb/descent/runnable)
 # -------------------------
-def classify_gradient(g: float) -> str:
-    if g > 3:
+def classify_gradient(g: float, athlete_capabilities: dict = None) -> str:
+    """
+    Classify gradient as climb/descent/runnable.
+    
+    If athlete_capabilities provided, uses athlete-specific thresholds.
+    Otherwise, uses default thresholds (±3%).
+    
+    Args:
+        g: Gradient percentage
+        athlete_capabilities: Optional dict with 'power_hike_threshold_gradient_pct'
+        
+    Returns:
+        "climb", "descent", or "runnable"
+    """
+    if athlete_capabilities:
+        # Athlete-aware thresholds
+        hike_threshold = athlete_capabilities.get('power_hike_threshold_gradient_pct', 8.0)
+        
+        # Climb threshold = 60% of hike threshold
+        # (can still run, but it's definitely a climb)
+        # e.g., hike at 8% -> climb at 4.8%
+        climb_threshold = hike_threshold * 0.6
+        
+        # Descent threshold (less athlete-dependent, but adjust slightly)
+        # More experienced athletes can handle steeper descents as "runnable"
+        if hike_threshold >= 10:  # Elite
+            descent_threshold = -5.0
+        elif hike_threshold <= 6:  # Beginner
+            descent_threshold = -3.0
+        else:
+            descent_threshold = -4.0
+    else:
+        # Default thresholds (backward compatible)
+        climb_threshold = 3.0
+        descent_threshold = -3.0
+    
+    if g > climb_threshold:
         return "climb"
-    elif g < -3:
+    elif g < descent_threshold:
         return "descent"
     else:
         return "runnable"
 
 
-def add_segment_labels(df_res: pd.DataFrame) -> pd.DataFrame:
-    df_res["segment_type_raw"] = df_res["gradient_final"].apply(classify_gradient)
+def add_segment_labels(df_res: pd.DataFrame, athlete_capabilities: dict = None) -> pd.DataFrame:
+    """
+    Add segment type labels based on gradient.
+    
+    Args:
+        df_res: Resampled dataframe with gradients
+        athlete_capabilities: Optional dict for athlete-aware classification
+    """
+    if athlete_capabilities:
+        df_res["segment_type_raw"] = df_res["gradient_final"].apply(
+            lambda g: classify_gradient(g, athlete_capabilities)
+        )
+    else:
+        df_res["segment_type_raw"] = df_res["gradient_final"].apply(classify_gradient)
     return df_res
 
 
@@ -306,14 +408,213 @@ def _coalesce_adjacent_same_type(seg_df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 # Enrich + climbs + summaries
 # -------------------------
-def enrich_segments(segments_df: pd.DataFrame) -> pd.DataFrame:
+def add_multiscale_info_to_segments(
+    segments_df: pd.DataFrame,
+    df_res: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Add multi-scale gradient information to segments.
+    
+    For each segment, extract:
+    - Maximum gradient at different scales (50m, 500m)
+    - Gradient variability
+    
+    Args:
+        segments_df: Segments dataframe
+        df_res: Resampled dataframe with multi-scale gradients
+    
+    Returns:
+        Segments with added multi-scale columns
+    """
+    seg = segments_df.copy()
+    
+    # Check if multi-scale data is available
+    has_50m = "gradient_50m" in df_res.columns
+    has_500m = "gradient_500m" in df_res.columns
+    has_variability = "gradient_variability" in df_res.columns
+    
+    if not (has_50m or has_500m):
+        return seg
+    
+    dist = df_res["cum_distance"].to_numpy(dtype=float)
+    
+    # For each segment, find max gradients and variability
+    max_grad_50m = []
+    avg_grad_500m = []
+    max_variability = []
+    
+    for _, segment in seg.iterrows():
+        start_m = float(segment["start_km"]) * 1000
+        end_m = float(segment["end_km"]) * 1000
+        
+        # Find indices within this segment
+        mask = (dist >= start_m) & (dist <= end_m)
+        
+        if has_50m:
+            segment_50m = df_res.loc[mask, "gradient_50m"]
+            max_grad_50m.append(segment_50m.abs().max() if len(segment_50m) > 0 else 0)
+        
+        if has_500m:
+            segment_500m = df_res.loc[mask, "gradient_500m"]
+            avg_grad_500m.append(segment_500m.mean() if len(segment_500m) > 0 else 0)
+        
+        if has_variability:
+            segment_var = df_res.loc[mask, "gradient_variability"]
+            max_variability.append(segment_var.max() if len(segment_var) > 0 else 0)
+    
+    if has_50m:
+        seg["max_gradient_50m"] = max_grad_50m
+    if has_500m:
+        seg["avg_gradient_500m"] = avg_grad_500m
+    if has_variability:
+        seg["gradient_variability"] = max_variability
+    
+    return seg
+
+
+def enrich_segments(
+    segments_df: pd.DataFrame, 
+    df_res: pd.DataFrame = None,
+    athlete_profile: dict = None,
+    race_start_time: str = "07:00"
+) -> pd.DataFrame:
+    """
+    Enrich segments with derived metrics including:
+    - Basic gain/loss flags
+    - Cumulative metrics (distance, gain) for fatigue modeling
+    - Difficulty scores for LLM reasoning
+    - Race position context (early/mid/late)
+    - Multi-scale gradient information (if df_res provided)
+    - Time-of-day estimates (if athlete profile provided)
+    
+    Args:
+        segments_df: Base segments dataframe
+        df_res: Optional resampled dataframe for multi-scale gradient extraction
+        athlete_profile: Optional athlete profile for time estimates
+        race_start_time: Race start time in "HH:MM" format
+    """
     seg = segments_df.copy()
     seg["gain_m"] = seg["elev_change_m"].clip(lower=0)
     seg["loss_m"] = (-seg["elev_change_m"]).clip(lower=0)
     seg["is_climb"] = seg["type"] == "climb"
     seg["is_descent"] = seg["type"] == "descent"
     seg["is_runnable"] = seg["type"] == "runnable"
+    
+    # Add cumulative metrics for fatigue modeling
+    seg["cumulative_distance_km"] = seg["end_km"]
+    seg["cumulative_gain_m"] = seg["gain_m"].cumsum()
+    
+    # Calculate difficulty score: combines gain, gradient, and distance
+    # Formula: (gain/100) * (1 + gradient/10) * (1 + distance/5)
+    # This gives a single number representing "effort cost"
+    seg["difficulty_score"] = (
+        (seg["gain_m"] / 100.0) * 
+        (1.0 + seg["avg_gradient"].abs() / 10.0) * 
+        (1.0 + seg["distance_km"] / 5.0)
+    )
+    
+    # Determine race position (early/mid/late) for context-aware pacing
+    total_km = seg["end_km"].max()
+    def get_race_position(end_km):
+        if end_km < total_km * 0.3:
+            return "early"
+        elif end_km < total_km * 0.7:
+            return "mid"
+        else:
+            return "late"
+    
+    seg["race_position"] = seg["end_km"].apply(get_race_position)
+    
+    # Add multi-scale gradient info if available
+    if df_res is not None:
+        seg = add_multiscale_info_to_segments(seg, df_res)
+    
+    # Add time-of-day estimates if athlete profile provided
+    if athlete_profile:
+        from src.time_estimator import add_time_of_day_estimates
+        seg = add_time_of_day_estimates(seg, athlete_profile, race_start_time)
+    
     return seg
+
+
+def build_hierarchical_segments(seg: pd.DataFrame) -> dict:
+    """
+    Create both micro (detailed) and macro (high-level) segment views.
+    
+    Micro segments: Preserve all details for precise analysis
+    Macro segments: Aggressively merged for high-level race structure
+    
+    Args:
+        seg: Detailed segments dataframe
+    
+    Returns:
+        Dictionary with 'micro' and 'macro' dataframes
+    """
+    # Micro segments: Keep all details (already provided)
+    micro_segments = seg.copy()
+    
+    # Macro segments: Merge more aggressively for race overview
+    # Use 1.0km minimum instead of 0.4km
+    macro_segments = _merge_short_segments(seg, min_segment_km=1.0)
+    macro_segments = _coalesce_adjacent_same_type(macro_segments)
+    
+    return {
+        "micro": micro_segments,
+        "macro": macro_segments,
+    }
+
+
+def summarize_macro_segments(macro_seg: pd.DataFrame) -> list:
+    """
+    Create high-level text summary of macro segments.
+    
+    Groups segments into major sections for race overview.
+    """
+    if macro_seg.empty:
+        return []
+    
+    summaries = []
+    current_phase = None
+    phase_start = 0
+    phase_end = 0
+    phase_gain = 0
+    phase_desc = []
+    
+    for idx, row in macro_seg.iterrows():
+        seg_type = row["type"]
+        end_km = row["end_km"]
+        gain = row["gain_m"]
+        
+        # Group similar terrain into phases
+        if current_phase is None:
+            current_phase = seg_type
+            phase_start = row["start_km"]
+            phase_end = end_km
+            phase_gain = gain
+            phase_desc.append(f"{row['distance_km']:.1f}km {seg_type}")
+        elif current_phase == seg_type or len(phase_desc) < 2:
+            # Continue current phase
+            phase_end = end_km
+            phase_gain += gain
+            phase_desc.append(f"{row['distance_km']:.1f}km {seg_type}")
+        else:
+            # Close current phase and start new one
+            phase_summary = f"{phase_start:.1f}-{phase_end:.1f}km: {', '.join(phase_desc)} (total gain: {phase_gain:.0f}m)"
+            summaries.append(phase_summary)
+            
+            # Start new phase
+            current_phase = seg_type
+            phase_start = row["start_km"]
+            phase_end = end_km
+            phase_gain = gain
+            phase_desc = [f"{row['distance_km']:.1f}km {seg_type}"]
+    
+    # Add final phase
+    if phase_desc:
+        phase_summary = f"{phase_start:.1f}-{phase_end:.1f}km: {', '.join(phase_desc)} (total gain: {phase_gain:.0f}m)"
+        summaries.append(phase_summary)
+    
+    return summaries
 
 
 def extract_key_climbs(
@@ -336,18 +637,36 @@ def extract_key_climbs(
     return climbs
 
 
-def summarize_course_overview(df_res: pd.DataFrame, seg: pd.DataFrame) -> dict:
+def summarize_course_overview(df_res: pd.DataFrame, seg: pd.DataFrame, course_type: str = "trail") -> dict:
+    """
+    Summarize course metrics with validation.
+    
+    Args:
+        df_res: Resampled dataframe
+        seg: Segments dataframe
+        course_type: "road", "trail", or "mountain" for validation
+    """
     dist_km = float(df_res["cum_distance"].iloc[-1]) / 1000.0
     elev = df_res["elev_smooth"].to_numpy(dtype=float)
     diffs = np.diff(elev)
     total_gain = float(diffs[diffs > 0].sum())
     total_loss = float(-diffs[diffs < 0].sum())
+    
+    # Validate elevation metrics
+    from src.elevation import validate_elevation_metrics
+    validation = validate_elevation_metrics(
+        total_gain_m=total_gain,
+        total_loss_m=total_loss,
+        distance_km=dist_km,
+        course_type=course_type
+    )
 
     return {
         "total_distance_km": round(dist_km, 1),
         "total_gain_m": int(total_gain),
         "total_loss_m": int(total_loss),
         "num_segments": int(len(seg)),
+        "elevation_validation": validation,
     }
 
 
@@ -383,15 +702,35 @@ def build_full_course_model(
     window_m: int = 100,
     min_run_m: float = 200.0,
     min_segment_km: float = 0.4,
+    athlete_profile: dict = None,
+    enable_multiscale: bool = True,
 ):
     """
-    Assumes df_gpx already has:
-      - cum_distance (m)
-      - elev_smooth (cleaned & smoothed)
+    Build complete course model with segments, climbs, and blocks.
+    
+    Args:
+        df_gpx: GPX dataframe with cum_distance and elev_smooth
+        step_m: Resampling step in meters
+        window_m: Gradient calculation window in meters
+        min_run_m: Minimum distance for label smoothing
+        min_segment_km: Minimum segment size for merging
+        athlete_profile: Optional athlete profile for athlete-aware segmentation
+        enable_multiscale: Whether to compute multi-scale gradients
     """
+    # Calculate athlete capabilities if profile provided
+    athlete_capabilities = None
+    if athlete_profile:
+        from src.athlete_profile import calculate_athlete_capabilities
+        athlete_capabilities = calculate_athlete_capabilities(athlete_profile)
+    
     df_res = resample_to_uniform(df_gpx, step_m=step_m)
     df_res = compute_window_gradient(df_res, window_m=window_m)
-    df_res = add_segment_labels(df_res)
+    
+    # Optionally compute multi-scale gradients
+    if enable_multiscale:
+        df_res = compute_multiscale_gradients(df_res)
+    
+    df_res = add_segment_labels(df_res, athlete_capabilities=athlete_capabilities)
 
     # smooth noisy label runs before segmenting
     df_res = _smooth_point_labels_by_distance(df_res, min_run_m=min_run_m)
@@ -403,12 +742,28 @@ def build_full_course_model(
     merged_segments = _merge_short_segments(raw_segments, min_segment_km=min_segment_km)
     merged_segments = _coalesce_adjacent_same_type(merged_segments)
 
-    seg = enrich_segments(merged_segments)
+    # Enrich segments with metrics, multi-scale info, and time-of-day estimates
+    race_start_time = athlete_profile.get("race_start_time", "07:00") if athlete_profile else "07:00"
+    seg = enrich_segments(
+        merged_segments, 
+        df_res=df_res,  # Pass for multi-scale gradient extraction
+        athlete_profile=athlete_profile, 
+        race_start_time=race_start_time
+    )
+    
+    # Build hierarchical views (micro + macro)
+    hierarchical = build_hierarchical_segments(seg)
+    macro_seg = hierarchical["macro"]
+    
     key_climbs = extract_key_climbs(seg)
     climb_blocks = build_climb_blocks(seg)
 
     course_summary = summarize_course_overview(df_res, seg)
     segment_summaries = summarize_segments(seg)
     climb_summaries = summarize_key_climbs(key_climbs)
+    
+    # Add macro segment summary to course summary
+    macro_summaries = summarize_macro_segments(macro_seg)
+    course_summary["macro_structure"] = macro_summaries
 
     return df_res, seg, key_climbs, climb_blocks, course_summary, segment_summaries, climb_summaries

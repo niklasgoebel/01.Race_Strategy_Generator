@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -22,9 +22,9 @@ from src.race_strategy_generator import generate_race_strategy
 class PipelineConfig:
     gpx_path: str
 
-    # elevation smoothing controls (advanced)
-    savgol_window_length: int = 13
-    savgol_polyorder: int = 3
+    # elevation smoothing controls (optional - auto-determined if not provided)
+    savgol_window_length: Optional[int] = None
+    savgol_polyorder: Optional[int] = None
 
     # model controls
     llm_model: str = "gpt-4.1-mini"
@@ -38,6 +38,9 @@ class PipelineConfig:
 
     # helpful during debugging
     llm_verbose: bool = False
+    
+    # athlete profile (optional, uses default if None)
+    athlete_profile: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -65,6 +68,11 @@ class PipelineResult:
     segments_df: pd.DataFrame
     climbs_df: pd.DataFrame
     strategy_tables: Dict[str, pd.DataFrame]
+    
+    # time estimates
+    segments_with_times: Optional[pd.DataFrame] = None
+    finish_time_range: Optional[Dict[str, float]] = None
+    aid_station_splits: Optional[pd.DataFrame] = None
 
 
 def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
@@ -73,6 +81,9 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     This is what the notebook / web app / CLI should call.
     """
 
+    # Use provided profile or fallback to default (needed for athlete-aware segmentation and time estimates)
+    athlete_profile = cfg.athlete_profile if cfg.athlete_profile is not None else get_default_athlete_profile()
+    
     # 1) Load + clean GPX (robust elevation handling)
     df_gpx = load_gpx_to_df(
         cfg.gpx_path,
@@ -80,7 +91,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         polyorder=cfg.savgol_polyorder,
     )
 
-    # 2) Build full course model
+    # 2) Build full course model with athlete-aware segmentation
     (
         df_res,
         seg,
@@ -89,7 +100,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         course_summary,
         segment_summaries,
         climb_summaries,
-    ) = build_full_course_model(df_gpx)
+    ) = build_full_course_model(df_gpx, athlete_profile=athlete_profile)
 
     # Defensive: ensure we always have a DataFrame
     if climb_blocks is None:
@@ -115,13 +126,14 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     should_skip = bool(cfg.skip_llm) or (str(cfg.llm_model).upper() == "SKIP")
 
     if not should_skip:
-        athlete_profile = get_default_athlete_profile()
         strategy_text, strategy_data = generate_race_strategy(
             course_summary=course_summary,
             segment_summaries=segment_summaries,
             climb_summaries=climb_summaries,
             climb_block_summaries=climb_block_summaries,
             athlete_profile=athlete_profile,
+            segments_df=seg,  # Pass enriched segments dataframe
+            climb_blocks_df=climb_blocks,  # Pass climb blocks dataframe
             model=cfg.llm_model,
             max_output_tokens=cfg.llm_max_output_tokens,
             json_only=bool(cfg.llm_json_only),
@@ -133,6 +145,30 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     overview_df = make_course_overview_table(course_summary)
     segments_df = make_segments_table(seg)
     climbs_df = make_key_climbs_table(key_climbs)
+    
+    # 5) Time estimates (if profile available)
+    segments_with_times = None
+    finish_time_range = None
+    aid_station_splits = None
+    
+    if athlete_profile:
+        from src.time_estimator import (
+            estimate_segment_times,
+            calculate_finish_time_range,
+            format_time_hhmm,
+        )
+        
+        segments_with_times = estimate_segment_times(seg, athlete_profile)
+        conservative, expected, aggressive = calculate_finish_time_range(segments_with_times)
+        
+        finish_time_range = {
+            "conservative_min": conservative,
+            "conservative_str": format_time_hhmm(conservative),
+            "expected_min": expected,
+            "expected_str": format_time_hhmm(expected),
+            "aggressive_min": aggressive,
+            "aggressive_str": format_time_hhmm(aggressive),
+        }
 
     return PipelineResult(
         df_gpx=df_gpx,
@@ -150,4 +186,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         segments_df=segments_df,
         climbs_df=climbs_df,
         strategy_tables=strategy_tables,
+        segments_with_times=segments_with_times,
+        finish_time_range=finish_time_range,
+        aid_station_splits=aid_station_splits,
     )

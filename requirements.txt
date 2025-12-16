@@ -11,3 +11,4 @@ python-dotenv>=1.2
 requests>=2.32
 tenacity>=9.1
 tqdm>=4.67
+fpdf2>=2.7

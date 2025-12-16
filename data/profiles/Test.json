@@ -1,0 +1,21 @@
+{
+  "name": "Test",
+  "target_race": "",
+  "race_date": "",
+  "experience": "Beginner/First Ultra",
+  "weekly_volume_km": 60,
+  "long_run_km": 20,
+  "recent_best_5k": "",
+  "recent_best_half_marathon": "",
+  "preferred_ascent_effort": "steady and controlled",
+  "descent_style": "confident",
+  "heat_tolerance": "average",
+  "goal_type": "Smart pacing, finish strong",
+  "fuel_type": "Gels + sports drink",
+  "hydration_notes": "carry water, refill at aid stations",
+  "vo2max": 50,
+  "max_hr": 190,
+  "lactate_threshold_hr": 170,
+  "lactate_threshold_pace_per_km": "4:30",
+  "carbs_per_hour_target_g": 60
+}

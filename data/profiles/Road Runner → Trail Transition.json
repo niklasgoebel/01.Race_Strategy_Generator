@@ -1,0 +1,21 @@
+{
+  "name": "Road Runner → Trail Transition",
+  "target_race": "first trail ultra",
+  "race_date": "",
+  "experience": "Intermediate (some ultras)",
+  "weekly_volume_km": 75,
+  "long_run_km": 28,
+  "vo2max": 54,
+  "max_hr": 192,
+  "lactate_threshold_hr": 178,
+  "lactate_threshold_pace_per_km": "4:20",
+  "recent_best_5k": "19:00",
+  "recent_best_half_marathon": "1:30:00",
+  "preferred_ascent_effort": "learning to pace climbs, tendency to go too hard",
+  "descent_style": "still developing confidence on technical descents",
+  "heat_tolerance": "good, from road racing experience",
+  "goal_type": "Smart pacing, finish strong",
+  "fuel_type": "Gels + sports drink",
+  "carbs_per_hour_target_g": 70,
+  "hydration_notes": "vest with soft flasks, learning ultra hydration needs"
+}

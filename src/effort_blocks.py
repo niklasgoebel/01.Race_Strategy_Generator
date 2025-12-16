@@ -17,6 +17,28 @@ class EffortBlocksConfig:
     min_block_dist_km: float = 0.8
 
 
+def calculate_effort_cost(block: Dict[str, Any]) -> float:
+    """
+    Calculate a single "effort cost" metric for a climb block.
+    
+    Combines distance, gain, and gradient into a single difficulty score
+    that the LLM can use for reasoning about pacing and fatigue.
+    
+    Formula:
+    - Base cost = gain_m / 100 (100m gain = 1 unit)
+    - Gradient multiplier = 1 + (avg_gradient / 10) (steeper = harder)
+    - Distance fatigue = 1 + (distance_km / 5) (longer = more fatigue)
+    
+    Returns:
+        Float representing relative difficulty (higher = harder)
+    """
+    base_cost = float(block.get("gain_m", 0)) / 100.0
+    gradient_multiplier = 1.0 + (float(block.get("avg_gradient_pct", 0)) / 10.0)
+    distance_fatigue = 1.0 + (float(block.get("distance_km", 0)) / 5.0)
+    
+    return base_cost * gradient_multiplier * distance_fatigue
+
+
 def build_climb_blocks(seg: pd.DataFrame, cfg: EffortBlocksConfig = EffortBlocksConfig()) -> pd.DataFrame:
     """
     Build higher-level "climb blocks" from the segment table.
@@ -40,6 +62,7 @@ def build_climb_blocks(seg: pd.DataFrame, cfg: EffortBlocksConfig = EffortBlocks
                 "num_climb_segments",
                 "num_runnable_gaps",
                 "longest_runnable_gap_km",
+                "effort_cost",
                 "notes",
             ]
         )
@@ -72,21 +95,25 @@ def build_climb_blocks(seg: pd.DataFrame, cfg: EffortBlocksConfig = EffortBlocks
 
         if block_gain >= cfg.min_block_gain_m and block_dist >= cfg.min_block_dist_km:
             avg_grad = (block_gain / (block_dist * 1000.0)) * 100.0 if block_dist > 0 else 0.0
-            blocks.append(
-                {
-                    "block_id": len(blocks) + 1,
-                    "start_km": float(start_km),
-                    "end_km": float(end_km),
-                    "distance_km": float(block_dist),
-                    "gain_m": float(block_gain),
-                    "loss_m": float(loss_m),
-                    "avg_gradient_pct": float(avg_grad),
-                    "num_climb_segments": int(climb_count),
-                    "num_runnable_gaps": int(runnable_gaps),
-                    "longest_runnable_gap_km": float(longest_gap),
-                    "notes": "sustained_climb_with_runnable_gaps" if runnable_gaps > 0 else "sustained_climb",
-                }
-            )
+            
+            block_data = {
+                "block_id": len(blocks) + 1,
+                "start_km": float(start_km),
+                "end_km": float(end_km),
+                "distance_km": float(block_dist),
+                "gain_m": float(block_gain),
+                "loss_m": float(loss_m),
+                "avg_gradient_pct": float(avg_grad),
+                "num_climb_segments": int(climb_count),
+                "num_runnable_gaps": int(runnable_gaps),
+                "longest_runnable_gap_km": float(longest_gap),
+                "notes": "sustained_climb_with_runnable_gaps" if runnable_gaps > 0 else "sustained_climb",
+            }
+            
+            # Calculate effort cost for this block
+            block_data["effort_cost"] = calculate_effort_cost(block_data)
+            
+            blocks.append(block_data)
 
         # reset
         in_block = False
@@ -163,7 +190,8 @@ def summarize_climb_blocks(blocks: pd.DataFrame, max_items: int = 10) -> List[st
         out.append(
             f"Climb block #{int(r['block_id'])}: {r['start_km']:.1f}–{r['end_km']:.1f} km "
             f"({r['distance_km']:.1f} km), gain {r['gain_m']:.0f} m, "
-            f"avg {r['avg_gradient_pct']:.1f}%, runnable gaps {int(r['num_runnable_gaps'])} "
+            f"avg {r['avg_gradient_pct']:.1f}%, effort cost {r.get('effort_cost', 0):.1f}, "
+            f"runnable gaps {int(r['num_runnable_gaps'])} "
             f"(max gap {r['longest_runnable_gap_km']:.2f} km)"
         )
     return out
