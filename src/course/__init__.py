@@ -1,1 +1,0 @@
-"""Race Strategy Generator package."""
