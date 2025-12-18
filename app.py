@@ -71,6 +71,11 @@ def _init_state() -> None:
     st.session_state.setdefault("picked_race_gpx_name", None)
     st.session_state.setdefault("picked_race_aid_stations", [])  # list[dict{name,km}]
     
+    # Uploaded GPX persistence
+    st.session_state.setdefault("uploaded_gpx_bytes", None)
+    st.session_state.setdefault("uploaded_gpx_filename", None)
+    st.session_state.setdefault("source_mode", None)
+    
     # Profile management
     st.session_state.setdefault("selected_profile_name", None)
     st.session_state.setdefault("show_profile_editor", False)
@@ -132,6 +137,9 @@ with col3:
             if delete_athlete_profile(selected_profile_name):
                 st.sidebar.success(f"Deleted '{selected_profile_name}'")
                 st.session_state["selected_profile_name"] = None
+                # Clear editing state to prevent stale profile references
+                if st.session_state.get("editing_profile_name") == selected_profile_name:
+                    st.session_state["editing_profile_name"] = None
                 st.rerun()
             else:
                 st.sidebar.error("Failed to delete profile")
@@ -144,7 +152,24 @@ if st.session_state.get("show_profile_editor", False):
         # Load existing profile or start with template
         if editing_name:
             st.caption(f"Editing: {editing_name}")
-            profile_data = load_athlete_profile(editing_name)
+            try:
+                profile_data = load_athlete_profile(editing_name)
+            except FileNotFoundError:
+                st.error(f"Profile '{editing_name}' not found. Starting with blank profile.")
+                st.session_state["editing_profile_name"] = None
+                profile_data = {
+                    "name": "",
+                    "experience": "",
+                    "weekly_volume_km": 60,
+                    "long_run_km": 20,
+                    "vo2max": 50,
+                    "max_hr": 190,
+                    "lactate_threshold_hr": 170,
+                    "lactate_threshold_pace_per_km": "4:30",
+                    "goal_type": "finish strong",
+                    "fuel_type": "gels + sports drink",
+                    "carbs_per_hour_target_g": 60,
+                }
         else:
             st.caption("Create new profile")
             # Offer templates
@@ -327,6 +352,19 @@ source_mode = st.sidebar.radio(
     index=0,
 )
 
+# Clear stale data when switching modes
+if st.session_state.get("source_mode") != source_mode:
+    if source_mode == "Race library (beta)":
+        # Switching to race library - clear uploaded GPX data
+        st.session_state["uploaded_gpx_bytes"] = None
+        st.session_state["uploaded_gpx_filename"] = None
+    else:
+        # Switching to upload mode - clear race library data
+        st.session_state["picked_race_id"] = None
+        st.session_state["picked_race_name"] = None
+        st.session_state["picked_race_gpx_name"] = None
+    st.session_state["source_mode"] = source_mode
+
 # -------------------------
 # Application settings
 # -------------------------
@@ -374,6 +412,15 @@ else:
     if gpx_file:
         gpx_bytes = gpx_file.getvalue()
         filename = gpx_file.name
+        source_label = "Uploaded GPX"
+        
+        # Store in session_state for comparison feature
+        st.session_state["uploaded_gpx_bytes"] = gpx_bytes
+        st.session_state["uploaded_gpx_filename"] = filename
+    elif st.session_state.get("uploaded_gpx_bytes"):
+        # Use cached uploaded GPX from session_state
+        gpx_bytes = st.session_state["uploaded_gpx_bytes"]
+        filename = st.session_state["uploaded_gpx_filename"]
         source_label = "Uploaded GPX"
 
 
@@ -965,8 +1012,13 @@ with tab_compare:
                 
                 if need_regenerate:
                     with st.spinner("Generating strategies for both profiles..."):
-                        # Get current race bytes
-                        if st.session_state.get("picked_race_id"):
+                        # Get current race bytes from appropriate source
+                        if st.session_state.get("uploaded_gpx_bytes"):
+                            # Use uploaded GPX
+                            gpx_bytes = st.session_state["uploaded_gpx_bytes"]
+                            filename = st.session_state.get("uploaded_gpx_filename", "uploaded.gpx")
+                        elif st.session_state.get("picked_race_id"):
+                            # Use race library
                             race_id = st.session_state["picked_race_id"]
                             gpx_bytes = load_race_gpx_bytes(race_id)
                             filename = st.session_state.get("picked_race_gpx_name", "race.gpx")
