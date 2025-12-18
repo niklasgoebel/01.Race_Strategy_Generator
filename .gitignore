@@ -23,6 +23,7 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+.cursor/
 
 # Build / test artifacts
 build/
